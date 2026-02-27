@@ -32,6 +32,21 @@ static int sel_tile_idx(const EditorState *s) {
     return s->sel_tile_y * s->chr_cols + s->sel_tile_x;
 }
 
+/* ── Palette assignment ───────────────────────────────────────── */
+
+/* Assign the active sub-palette to the tile (or sprite) under (mx, my). */
+static void assign_pal_at(EditorState *s, int mx, int my) {
+    if (mx < 0 || mx >= s->canvas_w || my < 0 || my >= s->canvas_h) return;
+    int t = screen_to_tile(s, mx, my);
+    if (s->sprite_mode == SPRITE_16 && s->chr_cols >= 2) {
+        int base = (t / 4) * 4;
+        for (int p = 0; p < 4; p++)
+            s->pal.tile_pal[base + p] = (uint8_t)s->active_sub_pal;
+    } else {
+        s->pal.tile_pal[t] = (uint8_t)s->active_sub_pal;
+    }
+}
+
 /* ── Text-input overlay ───────────────────────────────────────── */
 
 static void input_begin(EditorState *s, InputType type) {
@@ -46,6 +61,9 @@ static void input_begin(EditorState *s, InputType type) {
     } else if (type == INPUT_RESIZE) {
         snprintf(s->input_buf, sizeof(s->input_buf), "%dx%d",
                  s->chr_cols, s->chr_rows);
+        s->input_len = (int)strlen(s->input_buf);
+    } else if (type == INPUT_OPEN_PAL) {
+        snprintf(s->input_buf, sizeof(s->input_buf), "%s", s->pal_path);
         s->input_len = (int)strlen(s->input_buf);
     }
 
@@ -65,6 +83,9 @@ static void input_confirm(EditorState *s) {
             s->want_resize = true;
         }
         /* silently discard invalid input */
+    } else if (s->input_type == INPUT_OPEN_PAL) {
+        snprintf(s->pal_path, sizeof(s->pal_path), "%s", s->input_buf);
+        s->want_load_pal = true;
     } else {
         snprintf(s->current_path, sizeof(s->current_path), "%s", s->input_buf);
         if (s->input_type == INPUT_SAVE_AS) s->want_save = true;
@@ -148,6 +169,12 @@ static void select_tile_under_cursor(EditorState *s) {
 /* ── Panel click ──────────────────────────────────────────────── */
 
 static void panel_click(EditorState *s, int px, int py) {
+    /* Runtime NES picker geometry — must match render_panel. */
+    int nes_cell      = s->zoom * PANEL_NES_CELL_BASE;
+    int nes_step      = nes_cell + PANEL_NES_GAP;
+    int nes_x0        = (s->panel_w - PANEL_NES_COLS * nes_step + PANEL_NES_GAP) / 2;
+    int panel_view_y0 = PANEL_NES_Y0 + PANEL_NES_ROWS * nes_step + 10;
+
     if (py >= PANEL_PAL_Y0 && py < PANEL_PAL_Y0 + 8 * PANEL_PAL_ROW) {
         int row = (py - PANEL_PAL_Y0) / PANEL_PAL_ROW;
         if (row < 0 || row > 7) return;
@@ -167,17 +194,17 @@ static void panel_click(EditorState *s, int px, int py) {
         return;
     }
 
-    if (py >= PANEL_NES_Y0 && py < PANEL_NES_Y0 + 8 * PANEL_NES_STEP &&
-        px >= PANEL_NES_X0 && px < PANEL_NES_X0 + 8 * PANEL_NES_STEP) {
-        int col = (px - PANEL_NES_X0) / PANEL_NES_STEP;
-        int row = (py - PANEL_NES_Y0) / PANEL_NES_STEP;
-        if (col >= 0 && col < 8 && row >= 0 && row < 8)
+    if (py >= PANEL_NES_Y0 && py < PANEL_NES_Y0 + PANEL_NES_ROWS * nes_step &&
+        px >= nes_x0 && px < nes_x0 + PANEL_NES_COLS * nes_step) {
+        int col = (px - nes_x0) / nes_step;
+        int row = (py - PANEL_NES_Y0) / nes_step;
+        if (col >= 0 && col < PANEL_NES_COLS && row >= 0 && row < PANEL_NES_ROWS)
             s->pal.sub[s->active_sub_pal].idx[s->active_swatch] =
-                (uint8_t)(row * 8 + col);
+                (uint8_t)(row * PANEL_NES_COLS + col);
         return;
     }
 
-    if (py >= PANEL_VIEW_Y0 && py < PANEL_VIEW_Y0 + 16 &&
+    if (py >= panel_view_y0 && py < panel_view_y0 + 16 &&
         px >= 22 && px < 34)
         s->show_help = !s->show_help;
 }
@@ -241,7 +268,16 @@ void input_handle(const SDL_Event *e, EditorState *s) {
                 case SDLK_3: s->color = 3; break;
 
                 case SDLK_g: s->show_tile_grid  = !s->show_tile_grid;  break;
-                case SDLK_p: s->show_pixel_grid = !s->show_pixel_grid; break;
+                case SDLK_p:
+                    if (e->key.keysym.mod & KMOD_CTRL) {
+                        if (e->key.keysym.mod & KMOD_SHIFT)
+                            s->want_save_pal = true;
+                        else
+                            input_begin(s, INPUT_OPEN_PAL);
+                    } else {
+                        s->show_pixel_grid = !s->show_pixel_grid;
+                    }
+                    break;
                 case SDLK_v:
                     s->view_mode = (s->view_mode == VIEW_GRAYSCALE)
                                  ? VIEW_NES_COLOR : VIEW_GRAYSCALE;
@@ -331,22 +367,15 @@ void input_handle(const SDL_Event *e, EditorState *s) {
                 else                  panel_click(s, mx - s->canvas_w, my);
             }
             if (e->button.button == SDL_BUTTON_RIGHT) {
-                if (mx >= 0 && mx < s->canvas_w && my >= 0 && my < s->canvas_h) {
-                    int t = screen_to_tile(s, mx, my);
-                    if (s->sprite_mode == SPRITE_16 && s->chr_cols >= 2) {
-                        int base = (t / 4) * 4;
-                        for (int p = 0; p < 4; p++)
-                            s->pal.tile_pal[base + p] = (uint8_t)s->active_sub_pal;
-                    } else {
-                        s->pal.tile_pal[t] = (uint8_t)s->active_sub_pal;
-                    }
-                }
+                s->right_mouse_down = true;
+                assign_pal_at(s, mx, my);
             }
             break;
         }
 
         case SDL_MOUSEBUTTONUP:
-            if (e->button.button == SDL_BUTTON_LEFT) s->mouse_down = false;
+            if (e->button.button == SDL_BUTTON_LEFT)  s->mouse_down       = false;
+            if (e->button.button == SDL_BUTTON_RIGHT) s->right_mouse_down = false;
             break;
 
         case SDL_MOUSEMOTION: {
@@ -356,6 +385,8 @@ void input_handle(const SDL_Event *e, EditorState *s) {
                 if (mx < s->canvas_w) paint_at(s, mx, my);
                 else                  panel_click(s, mx - s->canvas_w, my);
             }
+            if (s->right_mouse_down)
+                assign_pal_at(s, mx, my);
             break;
         }
 

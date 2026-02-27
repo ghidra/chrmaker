@@ -8,15 +8,47 @@
 #include "input.h"
 #include "export.h"
 
+/* ── Palette sidecar path ─────────────────────────────────────── */
+
+/* Derive the .pal sidecar path from a .chr path.
+   "output.chr" → "output.pal"; "/p/f.chr" → "/p/f.pal";
+   files without an extension get ".pal" appended.             */
+static void make_pal_path(char *out, int outlen, const char *chr_path) {
+    snprintf(out, outlen, "%s", chr_path);
+    char *dot = strrchr(out, '.');
+    char *sl  = strrchr(out, '/');
+    if (dot && (!sl || dot > sl))
+        snprintf(dot, outlen - (int)(dot - out), ".pal");
+    else {
+        int len = (int)strlen(out);
+        snprintf(out + len, outlen - len, ".pal");
+    }
+}
+
 /* ── Dimension helpers ────────────────────────────────────────── */
 
 /* Call whenever chr_cols, chr_rows, or zoom change. */
 static void state_update_dims(EditorState *s) {
     s->canvas_w = s->chr_cols * TILE_W * s->zoom;
     s->canvas_h = s->chr_rows * TILE_H * s->zoom;
-    s->win_w    = s->canvas_w + PANEL_W;
-    s->win_h    = (s->canvas_h < PANEL_FULL_H ? PANEL_FULL_H : s->canvas_h)
-                  + STATUS_H;
+
+    /* NES colour picker scales with zoom: cell_px = zoom * PANEL_NES_CELL_BASE */
+    int nes_cell   = s->zoom * PANEL_NES_CELL_BASE;
+    int nes_step   = nes_cell + PANEL_NES_GAP;
+    int nes_grid_w = PANEL_NES_COLS * nes_step - PANEL_NES_GAP;
+
+    /* Panel wide enough for the picker (PANEL_PAL_X0 margin each side),
+       but never narrower than the fixed minimum PANEL_W.               */
+    int needed     = nes_grid_w + 2 * PANEL_PAL_X0;
+    s->panel_w     = (needed > PANEL_W) ? needed : PANEL_W;
+
+    /* Minimum panel height shifts down as the picker grows.            */
+    int panel_view_y0 = PANEL_NES_Y0 + PANEL_NES_ROWS * nes_step + 10;
+    int panel_full_h  = panel_view_y0 + 44;
+
+    s->win_w = s->canvas_w + s->panel_w;
+    s->win_h = (s->canvas_h < panel_full_h ? panel_full_h : s->canvas_h)
+               + STATUS_H;
 }
 
 /* ── State init ───────────────────────────────────────────────── */
@@ -41,15 +73,19 @@ static void state_init(EditorState *s, const char *path, int cols, int rows) {
     s->tile_mode       = false;
     s->sel_tile_x      = 0;
     s->sel_tile_y      = 0;
-    s->sprite_mode     = SPRITE_8;
+    s->sprite_mode     = SPRITE_16;
     s->wrap_mode       = WRAP_NONE;
-    s->mouse_down      = false;
-    s->show_help       = false;
+    s->mouse_down       = false;
+    s->right_mouse_down = false;
+    s->show_help        = false;
     s->input_mode      = false;
     s->input_len       = 0;
-    s->want_save       = false;
-    s->want_load       = false;
-    s->running         = true;
+    s->want_save        = false;
+    s->want_load        = false;
+    s->pal_path[0]      = '\0';
+    s->want_save_pal    = false;
+    s->want_load_pal    = false;
+    s->running          = true;
 
     snprintf(s->current_path, sizeof(s->current_path), "%s", path);
 }
@@ -127,6 +163,11 @@ int main(int argc, char *argv[]) {
                     render_resize(ren, &state);
                 }
                 set_title(win, arg_path);
+                /* Auto-load palette sidecar if present */
+                char pp[260];
+                make_pal_path(pp, sizeof(pp), arg_path);
+                if (palette_load(&state.pal, pp) == 0)
+                    state.view_mode = VIEW_NES_COLOR;
             }
         }
     }
@@ -141,11 +182,15 @@ int main(int argc, char *argv[]) {
             state.want_save = false;
             char msg[300];
             int  ntiles = state.chr_cols * state.chr_rows;
-            if (export_chr(&state.chr, ntiles, state.current_path) == 0)
+            if (export_chr(&state.chr, ntiles, state.current_path) == 0) {
                 snprintf(msg, sizeof(msg), "saved: %s (%d tiles)",
                          state.current_path, ntiles);
-            else
+                char pp[260];
+                make_pal_path(pp, sizeof(pp), state.current_path);
+                palette_save(&state.pal, pp); /* silent sidecar */
+            } else {
                 snprintf(msg, sizeof(msg), "ERROR saving %s", state.current_path);
+            }
             set_title(win, msg);
         }
         if (state.want_load) {
@@ -160,9 +205,36 @@ int main(int argc, char *argv[]) {
                 }
                 snprintf(msg, sizeof(msg), "opened: %s (%d tiles)",
                          state.current_path, tiles);
+                char pp[260];
+                make_pal_path(pp, sizeof(pp), state.current_path);
+                if (palette_load(&state.pal, pp) == 0)
+                    state.view_mode = VIEW_NES_COLOR;
             } else {
                 snprintf(msg, sizeof(msg), "ERROR opening %s", state.current_path);
             }
+            set_title(win, msg);
+        }
+
+        /* ── Explicit palette save/load ── */
+        if (state.want_save_pal) {
+            state.want_save_pal = false;
+            char pp[260], msg[300];
+            make_pal_path(pp, sizeof(pp), state.current_path);
+            if (palette_save(&state.pal, pp) == 0)
+                snprintf(msg, sizeof(msg), "palette saved: %s", pp);
+            else
+                snprintf(msg, sizeof(msg), "ERROR saving palette: %s", pp);
+            set_title(win, msg);
+        }
+        if (state.want_load_pal) {
+            state.want_load_pal = false;
+            char msg[300];
+            if (palette_load(&state.pal, state.pal_path) == 0) {
+                state.view_mode = VIEW_NES_COLOR;
+                snprintf(msg, sizeof(msg), "palette loaded: %s", state.pal_path);
+            }
+            else
+                snprintf(msg, sizeof(msg), "ERROR loading palette: %s", state.pal_path);
             set_title(win, msg);
         }
 

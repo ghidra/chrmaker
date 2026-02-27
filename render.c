@@ -277,18 +277,21 @@ static void render_status(SDL_Renderer *ren, const EditorState *s) {
     fill(ren, vx, SY, SW, SH, 28, 28, 28);
     if (v_on) vline(ren, vx + SW / 2, SY + 1, SH - 2, 60, 210, 60);
 
-    /* Zoom indicator */
+    /* Zoom and sprite-mode indicators — right-aligned so they always fit. */
     {
+        int ty_ind = STATUS_Y + (STATUS_H - font_line_h()) / 2 + 1;
+        int cw     = font_char_w();
+
         char zbuf[4];
         snprintf(zbuf, sizeof(zbuf), "%dX", s->zoom);
+        int zx = s->win_w - (int)strlen(zbuf) * cw - 4;
         static const SDL_Color ZCOL = {140, 160, 200, 255};
-        font_draw_str(ren, zbuf, 140, STATUS_Y + (STATUS_H - font_line_h()) / 2 + 1, ZCOL);
-    }
+        font_draw_str(ren, zbuf, zx, ty_ind, ZCOL);
 
-    /* Sprite-16 mode indicator */
-    if (s->sprite_mode == SPRITE_16) {
-        static const SDL_Color S16COL = {80, 210, 140, 255};
-        font_draw_str(ren, "S16", 170, STATUS_Y + (STATUS_H - font_line_h()) / 2 + 1, S16COL);
+        if (s->sprite_mode == SPRITE_16) {
+            static const SDL_Color S16COL = {80, 210, 140, 255};
+            font_draw_str(ren, "S16", zx - 3 * cw - 4, ty_ind, S16COL);
+        }
     }
 }
 
@@ -297,7 +300,13 @@ static void render_status(SDL_Renderer *ren, const EditorState *s) {
 static void render_panel(SDL_Renderer *ren, const EditorState *s) {
     const int BX = s->canvas_w;   /* panel left edge in screen coords */
 
-    fill(ren, BX, 0, PANEL_W, s->win_h - STATUS_H, 18, 18, 30);
+    /* Runtime NES picker geometry (cell size scales with zoom). */
+    int nes_cell      = s->zoom * PANEL_NES_CELL_BASE;
+    int nes_step      = nes_cell + PANEL_NES_GAP;
+    int nes_x0        = (s->panel_w - PANEL_NES_COLS * nes_step + PANEL_NES_GAP) / 2;
+    int panel_view_y0 = PANEL_NES_Y0 + PANEL_NES_ROWS * nes_step + 10;
+
+    fill(ren, BX, 0, s->panel_w, s->win_h - STATUS_H, 18, 18, 30);
 
     for (int i = 0; i < 8; i++) {
         int ry = PANEL_PAL_Y0 + i * PANEL_PAL_ROW;
@@ -317,14 +326,20 @@ static void render_panel(SDL_Renderer *ren, const EditorState *s) {
             SDL_Color c = NES_MASTER_PALETTE[s->pal.sub[i].idx[j] & 0x3F];
             fill(ren, sx, ry, PANEL_PAL_SW, PANEL_PAL_SH, c.r, c.g, c.b);
         }
+
+        /* Active-palette marker: amber * to the right of the swatches */
+        if (i == s->active_sub_pal) {
+            static const SDL_Color MARKC = {220, 200, 40, 255};
+            font_draw_char(ren, '*', BX + 104, ry - 2, MARKC);
+        }
     }
 
     {
         int sep = PANEL_PAL_Y0 + 4 * PANEL_PAL_ROW - 3;
-        hline(ren, BX + 2, sep, PANEL_W - 4, 55, 55, 80);
+        hline(ren, BX + 2, sep, s->panel_w - 4, 55, 55, 80);
     }
 
-    hline(ren, BX + 2, PANEL_ACT_Y0 - 4, PANEL_W - 4, 55, 55, 80);
+    hline(ren, BX + 2, PANEL_ACT_Y0 - 4, s->panel_w - 4, 55, 55, 80);
 
     for (int j = 0; j < 4; j++) {
         int sx = BX + PANEL_PAL_X0 + j * (PANEL_ACT_SW + PANEL_ACT_XGAP);
@@ -342,41 +357,40 @@ static void render_panel(SDL_Renderer *ren, const EditorState *s) {
              c.r, c.g, c.b);
     }
 
-    hline(ren, BX + 2, PANEL_NES_Y0 - 4, PANEL_W - 4, 55, 55, 80);
+    hline(ren, BX + 2, PANEL_NES_Y0 - 4, s->panel_w - 4, 55, 55, 80);
 
     uint8_t cur = s->pal.sub[s->active_sub_pal].idx[s->active_swatch] & 0x3F;
 
-    for (int row = 0; row < 8; row++) {
-        for (int col = 0; col < 8; col++) {
-            int  idx = row * 8 + col;
-            int  sx  = BX + PANEL_NES_X0 + col * PANEL_NES_STEP;
-            int  sy  =       PANEL_NES_Y0 + row * PANEL_NES_STEP;
+    for (int row = 0; row < PANEL_NES_ROWS; row++) {
+        for (int col = 0; col < PANEL_NES_COLS; col++) {
+            int  idx = row * PANEL_NES_COLS + col;
+            int  sx  = BX + nes_x0 + col * nes_step;
+            int  sy  =      PANEL_NES_Y0 + row * nes_step;
             SDL_Color c = NES_MASTER_PALETTE[idx];
 
             if ((uint8_t)idx == cur)
-                fill(ren, sx-1, sy-1, PANEL_NES_SZ+2, PANEL_NES_SZ+2,
-                     255, 255, 255);
+                fill(ren, sx-1, sy-1, nes_cell+2, nes_cell+2, 255, 255, 255);
 
-            fill(ren, sx, sy, PANEL_NES_SZ, PANEL_NES_SZ, c.r, c.g, c.b);
+            fill(ren, sx, sy, nes_cell, nes_cell, c.r, c.g, c.b);
         }
     }
 
-    hline(ren, BX + 2, PANEL_VIEW_Y0 - 4, PANEL_W - 4, 55, 55, 80);
+    hline(ren, BX + 2, panel_view_y0 - 4, s->panel_w - 4, 55, 55, 80);
 
     /* View-mode indicator dot */
     bool nes = (s->view_mode == VIEW_NES_COLOR);
-    fill(ren, BX + 4, PANEL_VIEW_Y0, 12, 12,
+    fill(ren, BX + 4, panel_view_y0, 12, 12,
          nes ? 40  : 28,
          nes ? 180 : 40,
          nes ? 40  : 28);
 
-    /* Help (?) button — click zone: py in [PANEL_VIEW_Y0, +16), px in [22, 34) */
+    /* Help (?) button — click zone: py in [panel_view_y0, +16), px in [22, 34) */
     {
         bool h = s->show_help;
-        fill(ren, BX + 21, PANEL_VIEW_Y0 - 1, 14, 18,
+        fill(ren, BX + 21, panel_view_y0 - 1, 14, 18,
              h ? 60 : 32, h ? 80 : 32, h ? 190 : 55);
         SDL_Color qcol = {200, 210, 240, 255};
-        font_draw_char(ren, '?', BX + 22, PANEL_VIEW_Y0 + 1, qcol);
+        font_draw_char(ren, '?', BX + 22, panel_view_y0 + 1, qcol);
     }
 }
 
@@ -386,7 +400,7 @@ static void render_help_overlay(SDL_Renderer *ren, const EditorState *s) {
 
     SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
     SDL_SetRenderDrawColor(ren, 0, 0, 18, 228);
-    SDL_Rect bg = {0, 0, s->canvas_w, s->win_h - STATUS_H};
+    SDL_Rect bg = {0, 0, s->win_w, s->win_h - STATUS_H};
     SDL_RenderFillRect(ren, &bg);
     SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
 
@@ -408,7 +422,7 @@ static void render_help_overlay(SDL_Renderer *ren, const EditorState *s) {
     font_draw_str(ren, "DRAWING",                         x, y, CYN); y += lh;
     font_draw_str(ren, " 0-3    SELECT COLOUR",           x, y, WHT); y += lh;
     font_draw_str(ren, " LMB    PAINT PIXELS",            x, y, WHT); y += lh;
-    font_draw_str(ren, " RMB    ASSIGN PAL TO TILE",      x, y, WHT); y += lh + hg;
+    font_draw_str(ren, " RMB    ASSIGN/PAINT PALETTE",    x, y, WHT); y += lh + hg;
 
     font_draw_str(ren, "TILE MODE",                       x, y, CYN); y += lh;
     font_draw_str(ren, " T      SELECT TILE",             x, y, WHT); y += lh;
@@ -427,6 +441,8 @@ static void render_help_overlay(SDL_Renderer *ren, const EditorState *s) {
     font_draw_str(ren, " CTRL+SHFT+S SAVE AS",            x, y, WHT); y += lh;
     font_draw_str(ren, " CTRL+O      OPEN",               x, y, WHT); y += lh;
     font_draw_str(ren, " CTRL+R      RESIZE CANVAS",      x, y, WHT); y += lh;
+    font_draw_str(ren, " CTRL+SHFT+P SAVE PALETTE",       x, y, WHT); y += lh;
+    font_draw_str(ren, " CTRL+P      LOAD PALETTE",       x, y, WHT); y += lh;
     font_draw_str(ren, " DROP FILE   OPEN",               x, y, WHT); y += lh;
     font_draw_str(ren, " =/-         ZOOM IN/OUT",        x, y, WHT); y += lh + hg;
 
@@ -439,9 +455,10 @@ static void render_help_overlay(SDL_Renderer *ren, const EditorState *s) {
 static void render_input_overlay(SDL_Renderer *ren, const EditorState *s) {
     if (!s->input_mode) return;
 
-    const int BOX_W = 480, BOX_H = 76;
-    const int BOX_X = (s->canvas_w        - BOX_W) / 2;
-    const int BOX_Y = (s->win_h - STATUS_H - BOX_H) / 2;
+    const int BOX_H  = 76;
+    const int BOX_W  = (s->win_w - 20 < 480) ? s->win_w - 20 : 480;
+    const int BOX_X  = (s->win_w - BOX_W) / 2;
+    const int BOX_Y  = (s->win_h - STATUS_H - BOX_H) / 2;
 
     SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
     SDL_SetRenderDrawColor(ren, 8, 8, 28, 235);
@@ -461,15 +478,18 @@ static void render_input_overlay(SDL_Renderer *ren, const EditorState *s) {
     int lh = font_line_h();
 
     const char *title;
-    if      (s->input_type == INPUT_SAVE_AS) title = "SAVE AS:";
-    else if (s->input_type == INPUT_OPEN)    title = "OPEN FILE:";
-    else                                     title = "RESIZE (COLSxROWS):";
+    if      (s->input_type == INPUT_SAVE_AS)  title = "SAVE AS:";
+    else if (s->input_type == INPUT_OPEN)     title = "OPEN FILE:";
+    else if (s->input_type == INPUT_OPEN_PAL) title = "OPEN PALETTE:";
+    else                                      title = "RESIZE (COLSxROWS):";
     font_draw_str(ren, title, tx, ty, YLW);
     ty += lh;
 
-    /* Show last 36 chars of the buffer so cursor is always visible. */
+    /* Show as many trailing chars as fit in the box; cursor always visible. */
+    int  max_chars = (BOX_W - 24) / font_char_w();
+    if (max_chars < 1) max_chars = 1;
     char display[40];
-    int  start = (s->input_len > 36) ? (s->input_len - 36) : 0;
+    int  start = (s->input_len > max_chars - 1) ? (s->input_len - max_chars + 1) : 0;
     int  dlen  = s->input_len - start;
     memcpy(display, s->input_buf + start, (size_t)dlen);
     bool cursor_on = (SDL_GetTicks() % 1000) < 500;

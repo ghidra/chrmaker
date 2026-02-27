@@ -21,18 +21,15 @@
 #define PANEL_ACT_SH   18    /* large swatch height                 */
 #define PANEL_ACT_XGAP  2    /* gap between large swatches          */
 
-/* ── Section 3: NES master palette picker (8×8 grid) ────────────*/
-#define PANEL_NES_SZ   13    /* each cell size (square)             */
-#define PANEL_NES_GAP   1    /* 1px gap between cells               */
-#define PANEL_NES_STEP (PANEL_NES_SZ + PANEL_NES_GAP)   /* 14 px  */
-/* Centred horizontally within the panel: */
-#define PANEL_NES_X0   ((PANEL_W - 8 * PANEL_NES_STEP + PANEL_NES_GAP) / 2)
-#define PANEL_NES_Y0   (PANEL_ACT_Y0 + PANEL_ACT_SH + 10)
+/* ── Section 3: NES master palette picker (16×4 grid) ───────────
+   16 columns = one per hue; 4 rows = one per brightness tier.
+   idx = row * 16 + col maps directly to NES master palette index.
 
-/* ── Section 4: view-mode indicator ─────────────────────────────*/
-#define PANEL_VIEW_Y0  (PANEL_NES_Y0 + 8 * PANEL_NES_STEP + 10)
-
-/* ── Minimum window height to show the full panel ────────────────
-   Used by state_update_dims to ensure the window is tall enough
-   to display the ? button and view-mode indicator.               */
-#define PANEL_FULL_H   (PANEL_VIEW_Y0 + 44)
+   Cell size scales with zoom: cell_px = zoom * PANEL_NES_CELL_BASE.
+   Panel width, PANEL_VIEW_Y0, and PANEL_FULL_H are therefore all
+   runtime — computed in state_update_dims() in main.c.           */
+#define PANEL_NES_COLS      16
+#define PANEL_NES_ROWS       4
+#define PANEL_NES_GAP        1   /* px gap between cells (fixed)    */
+#define PANEL_NES_CELL_BASE  3   /* cell_px = zoom * this           */
+#define PANEL_NES_Y0        (PANEL_ACT_Y0 + PANEL_ACT_SH + 10)

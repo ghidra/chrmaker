@@ -7,7 +7,8 @@
 #define TILE_H   8          /* pixels per tile, vertical   */
 
 /* ── Window / panel geometry (fixed) ─────────────────────────── */
-#define PANEL_W   128       /* palette panel width  — always 128 px   */
+#define PANEL_W   128       /* palette panel minimum width (runtime    */
+                            /* value lives in EditorState.panel_w)     */
 #define STATUS_H   20       /* status bar height    — always 20 px    */
 
 /* canvas_w, canvas_h, win_w, win_h are runtime-computed from
@@ -47,3 +48,10 @@ void chr_fill_debug(ChrPage *c);
    Returns the number of tiles loaded (>= 1), or -1 on error.
    Loads at most CHR_MAX_TILES tiles; larger files are truncated. */
 int  chr_load(ChrPage *c, const char *path);
+
+/* Save/load editor palette state to/from a binary .pal sidecar file.
+   Format: 4-byte magic "NPAL", 8×SubPalette (32 bytes),
+   tile_pal[CHR_MAX_TILES] (1024 bytes) — total 1060 bytes.
+   Returns 0 on success, -1 on error. */
+int  palette_save(const PaletteState *p, const char *path);
+int  palette_load(PaletteState *p, const char *path);

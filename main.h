@@ -14,7 +14,7 @@ typedef enum {
     WRAP_BOTH
 } WrapMode;
 
-typedef enum { INPUT_SAVE_AS, INPUT_OPEN, INPUT_RESIZE } InputType;
+typedef enum { INPUT_SAVE_AS, INPUT_OPEN, INPUT_RESIZE, INPUT_OPEN_PAL } InputType;
 
 typedef enum {
     SPRITE_8,    /* standard 8×8 tile display                          */
@@ -31,8 +31,9 @@ typedef struct {
     int          zoom;              /* screen pixels per NES pixel (1-4)   */
     int          canvas_w;          /* chr_cols * TILE_W * zoom            */
     int          canvas_h;          /* chr_rows * TILE_H * zoom            */
-    int          win_w;             /* canvas_w + PANEL_W                  */
-    int          win_h;             /* max(canvas_h, PANEL_FULL_H) + STATUS_H */
+    int          panel_w;           /* panel width; expands with zoom      */
+    int          win_w;             /* canvas_w + panel_w                  */
+    int          win_h;             /* max(canvas_h, panel_full_h) + STATUS_H */
     bool         want_resize;       /* triggers SDL_SetWindowSize in main  */
 
     /* Rendering */
@@ -58,12 +59,16 @@ typedef struct {
 
     /* Input */
     bool         mouse_down;
+    bool         right_mouse_down;
     int          mouse_x, mouse_y;   /* current screen cursor position */
 
     /* File operations */
-    char         current_path[256]; /* active file path for save/load      */
-    bool         want_save;         /* save to current_path                */
-    bool         want_load;         /* load from current_path              */
+    char         current_path[256]; /* active CHR file path for save/load  */
+    bool         want_save;         /* save CHR to current_path            */
+    bool         want_load;         /* load CHR from current_path          */
+    char         pal_path[256];     /* palette file path for manual load   */
+    bool         want_save_pal;     /* save palette (derived from current_path) */
+    bool         want_load_pal;     /* load palette from pal_path          */
 
     /* Text-input overlay (Save As / Open) */
     bool         input_mode;        /* text-input overlay is open          */

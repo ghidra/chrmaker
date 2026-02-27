@@ -59,6 +59,28 @@ int chr_load(ChrPage *c, const char *path) {
     return num_tiles;
 }
 
+int palette_save(const PaletteState *p, const char *path) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    int ok = (fwrite("NPAL", 1, 4, f) == 4 &&
+              fwrite(p->sub,      1, sizeof(p->sub),      f) == sizeof(p->sub) &&
+              fwrite(p->tile_pal, 1, sizeof(p->tile_pal), f) == sizeof(p->tile_pal));
+    fclose(f);
+    return ok ? 0 : -1;
+}
+
+int palette_load(PaletteState *p, const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    char magic[4];
+    int ok = (fread(magic,      1, 4,                  f) == 4 &&
+              memcmp(magic, "NPAL", 4) == 0 &&
+              fread(p->sub,      1, sizeof(p->sub),      f) == sizeof(p->sub) &&
+              fread(p->tile_pal, 1, sizeof(p->tile_pal), f) == sizeof(p->tile_pal));
+    fclose(f);
+    return ok ? 0 : -1;
+}
+
 void palette_init(PaletteState *p) {
     memset(p, 0, sizeof(PaletteState));
 
