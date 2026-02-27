@@ -258,24 +258,17 @@ static void render_status(SDL_Renderer *ren, const EditorState *s) {
         fill(ren, sx, SY, SW, SH, c.r, c.g, c.b);
     }
 
+    /* Tile-mode + wrap indicator — one box, amber when active,
+       green crosshair lines show wrap axes (─ H, │ V, ┼ both). */
     int tx = 76;
     fill(ren, tx - 1, SY - 1, SW + 2, SH + 2, 55, 55, 55);
-    if (s->tile_mode)
-        fill(ren, tx, SY, SW, SH, 210, 155, 20);
-    else
-        fill(ren, tx, SY, SW, SH, 38,  38,  38);
-
-    int hx = 96;
-    bool h_on = (s->wrap_mode == WRAP_H || s->wrap_mode == WRAP_BOTH);
-    fill(ren, hx - 1, SY - 1, SW + 2, SH + 2, 55, 55, 55);
-    fill(ren, hx, SY, SW, SH, 28, 28, 28);
-    if (h_on) hline(ren, hx + 1, SY + SH / 2, SW - 2, 60, 210, 60);
-
-    int vx = 116;
-    bool v_on = (s->wrap_mode == WRAP_V || s->wrap_mode == WRAP_BOTH);
-    fill(ren, vx - 1, SY - 1, SW + 2, SH + 2, 55, 55, 55);
-    fill(ren, vx, SY, SW, SH, 28, 28, 28);
-    if (v_on) vline(ren, vx + SW / 2, SY + 1, SH - 2, 60, 210, 60);
+    fill(ren, tx, SY, SW, SH, s->tile_mode ? 210 : 38,
+                              s->tile_mode ? 155 : 38,
+                              s->tile_mode ?  20 : 38);
+    if (s->wrap_mode == WRAP_H || s->wrap_mode == WRAP_BOTH)
+        hline(ren, tx + 1, SY + SH / 2, SW - 2, 0, 0, 0);
+    if (s->wrap_mode == WRAP_V || s->wrap_mode == WRAP_BOTH)
+        vline(ren, tx + SW / 2, SY + 1, SH - 2, 0, 0, 0);
 
     /* Zoom and sprite-mode indicators — right-aligned so they always fit. */
     {
