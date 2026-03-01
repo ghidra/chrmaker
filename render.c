@@ -212,6 +212,64 @@ static void render_pixel_grid(SDL_Renderer *ren, const EditorState *s) {
     SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
 }
 
+/* ── Animation helpers ────────────────────────────────────────── */
+
+/* Compute screen position and base tile for animation frame f. */
+static void anim_frame_screen(const EditorState *s, int f,
+                               int *out_sx, int *out_sy, int *out_base) {
+    int stride = (s->sprite_mode == SPRITE_16 && s->chr_cols >= 2) ? 4 : 1;
+    int base   = s->anim_first + f * stride;
+    if (s->sprite_mode == SPRITE_16 && s->chr_cols >= 2) {
+        int sprite_cols = s->chr_cols / 2;
+        int S  = base / 4;
+        int sx = S % sprite_cols;
+        int sy = S / sprite_cols;
+        *out_sx = sx * 2 * TILE_W * s->zoom;
+        *out_sy = sy * 2 * TILE_H * s->zoom;
+    } else {
+        *out_sx = (base % s->chr_cols) * TILE_W * s->zoom;
+        *out_sy = (base / s->chr_cols) * TILE_H * s->zoom;
+    }
+    *out_base = base;
+}
+
+/* Draw one ghost frame at screen position (sx, sy) with given alpha. */
+static void draw_ghost_tile(SDL_Renderer *ren, const EditorState *s,
+                             int base_tile, int sx, int sy, Uint8 alpha) {
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+    if (s->sprite_mode == SPRITE_16 && s->chr_cols >= 2) {
+        for (int row = 0; row < TILE_H * 2; row++) {
+            for (int col = 0; col < TILE_W * 2; col++) {
+                int p = (col / TILE_W) * 2 + (row / TILE_H);
+                int t = base_tile + p;
+                if (t < 0 || t >= CHR_MAX_TILES) continue;
+                uint8_t val = s->chr.px[t][row % TILE_H][col % TILE_W] & 3;
+                SDL_Color c = get_display_color(s, t, val);
+                SDL_SetRenderDrawColor(ren, c.r, c.g, c.b, alpha);
+                SDL_Rect r = { sx + col * s->zoom, sy + row * s->zoom,
+                               s->zoom, s->zoom };
+                SDL_RenderFillRect(ren, &r);
+            }
+        }
+    } else {
+        if (base_tile < 0 || base_tile >= CHR_MAX_TILES) {
+            SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+            return;
+        }
+        for (int row = 0; row < TILE_H; row++) {
+            for (int col = 0; col < TILE_W; col++) {
+                uint8_t val = s->chr.px[base_tile][row][col] & 3;
+                SDL_Color c = get_display_color(s, base_tile, val);
+                SDL_SetRenderDrawColor(ren, c.r, c.g, c.b, alpha);
+                SDL_Rect r = { sx + col * s->zoom, sy + row * s->zoom,
+                               s->zoom, s->zoom };
+                SDL_RenderFillRect(ren, &r);
+            }
+        }
+    }
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+}
+
 /* ── Tile highlight ───────────────────────────────────────────── */
 static void render_tile_highlight(SDL_Renderer *ren, const EditorState *s) {
     if (!s->tile_mode) return;
@@ -231,6 +289,47 @@ static void render_tile_highlight(SDL_Renderer *ren, const EditorState *s) {
     SDL_SetRenderDrawColor(ren, 255, 210, 40, 255);
     SDL_Rect border = {tx, ty, tw, th};
     SDL_RenderDrawRect(ren, &border);
+}
+
+/* ── Animation frame highlight (cyan border) ─────────────────── */
+static void render_anim_frame_highlight(SDL_Renderer *ren, const EditorState *s) {
+    if (s->anim_state != ANIM_ACTIVE) return;
+
+    int sx, sy, base;
+    anim_frame_screen(s, s->anim_cur, &sx, &sy, &base);
+
+    int mult = (s->sprite_mode == SPRITE_16 && s->chr_cols >= 2) ? 2 : 1;
+    int tw   = TILE_W * mult * s->zoom;
+    int th   = TILE_H * mult * s->zoom;
+
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(ren, 0, 0, 0, 160);
+    SDL_Rect shadow = { sx - 1, sy - 1, tw + 2, th + 2 };
+    SDL_RenderDrawRect(ren, &shadow);
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+
+    SDL_SetRenderDrawColor(ren, 0, 220, 255, 255);
+    SDL_Rect border = { sx, sy, tw, th };
+    SDL_RenderDrawRect(ren, &border);
+}
+
+/* ── Animation ghost overlays ─────────────────────────────────── */
+static void render_anim_ghosts(SDL_Renderer *ren, const EditorState *s) {
+    if (s->anim_state != ANIM_ACTIVE) return;
+
+    int sx, sy, cur_base;
+    anim_frame_screen(s, s->anim_cur, &sx, &sy, &cur_base);
+
+    if (s->anim_cur > 0) {
+        int prev_base, dummy_sx, dummy_sy;
+        anim_frame_screen(s, s->anim_cur - 1, &dummy_sx, &dummy_sy, &prev_base);
+        draw_ghost_tile(ren, s, prev_base, sx, sy, 80);
+    }
+    if (s->anim_cur < s->anim_frame_count - 1) {
+        int next_base, dummy_sx, dummy_sy;
+        anim_frame_screen(s, s->anim_cur + 1, &dummy_sx, &dummy_sy, &next_base);
+        draw_ghost_tile(ren, s, next_base, sx, sy, 50);
+    }
 }
 
 /* ── Status bar ───────────────────────────────────────────────── */
@@ -281,10 +380,119 @@ static void render_status(SDL_Renderer *ren, const EditorState *s) {
         static const SDL_Color ZCOL = {140, 160, 200, 255};
         font_draw_str(ren, zbuf, zx, ty_ind, ZCOL);
 
+        int ind_x = zx;
         if (s->sprite_mode == SPRITE_16) {
+            ind_x -= 3 * cw + 4;
             static const SDL_Color S16COL = {80, 210, 140, 255};
-            font_draw_str(ren, "S16", zx - 3 * cw - 4, ty_ind, S16COL);
+            font_draw_str(ren, "S16", ind_x, ty_ind, S16COL);
         }
+        if (s->anim_state != ANIM_OFF) {
+            ind_x -= 4 * cw + 4;
+            static const SDL_Color ANIMCOL = {0, 200, 255, 255};
+            font_draw_str(ren, "ANIM", ind_x, ty_ind, ANIMCOL);
+        }
+    }
+}
+
+/* ── Animation panel section ──────────────────────────────────── */
+static void render_anim_section(SDL_Renderer *ren, const EditorState *s,
+                                 int panel_view_y0) {
+    const int BX    = s->canvas_w;
+    int anim_y0     = panel_view_y0 + 44 + 8;
+
+    hline(ren, BX + 2, panel_view_y0 + 44 - 4, s->panel_w - 4, 55, 55, 80);
+
+    static const SDL_Color CYN = {  0, 200, 255, 255 };
+    static const SDL_Color DIM = {100, 100, 130, 255 };
+    static const SDL_Color WHT = {200, 200, 200, 255 };
+
+    font_draw_str(ren, "ANIM", BX + PANEL_PAL_X0, anim_y0, CYN);
+
+    const char *hint;
+    if      (s->anim_state == ANIM_PICKING_FIRST) hint = "PICK 1ST";
+    else if (s->anim_state == ANIM_PICKING_LAST)  hint = "PICK LST";
+    else                                           hint = "A:EXIT";
+    font_draw_str(ren, hint, BX + PANEL_PAL_X0 + 5 * font_char_w(), anim_y0, DIM);
+
+    /* Dynamic preview size: 4 screen px per NES px × anim_preview_zoom.
+       sprite-8 → 32 or 64; sprite-16 → 64 or 128. Capped to panel width. */
+    bool s16        = (s->sprite_mode == SPRITE_16 && s->chr_cols >= 2);
+    int  nes_sz     = s16 ? 16 : 8;
+    int  pz         = (s->anim_preview_zoom >= 2) ? 2 : 1;
+    int  preview_sz = nes_sz * 4 * pz;
+    int  max_prev   = s->panel_w - 2 * PANEL_PAL_X0;
+    if (preview_sz > max_prev) preview_sz = max_prev;
+    int  pix_sz     = preview_sz / nes_sz;
+
+    int preview_y = anim_y0 + 12 + 4;
+    int preview_x = BX + (s->panel_w - preview_sz) / 2;
+
+    /* Dark background; dim border hints at clickability */
+    fill(ren, preview_x - 1, preview_y - 1, preview_sz + 2, preview_sz + 2, 40, 40, 40);
+    SDL_SetRenderDrawColor(ren, 60, 60, 90, 255);
+    SDL_Rect pborder = { preview_x - 1, preview_y - 1, preview_sz + 2, preview_sz + 2 };
+    SDL_RenderDrawRect(ren, &pborder);
+
+    /* Zoom indicator in top-right corner of preview */
+    {
+        static const SDL_Color ZDIM = {80, 80, 110, 255};
+        char zlab[4]; snprintf(zlab, sizeof(zlab), "X%d", pz);
+        font_draw_str(ren, zlab, preview_x + preview_sz - 2 * font_char_w() - 1,
+                      preview_y + 1, ZDIM);
+    }
+
+    if (s->anim_state != ANIM_OFF) {
+        int stride = s16 ? 4 : 1;
+        int base   = s->anim_first + s->anim_cur * stride;
+
+        if (s16) {
+            for (int row = 0; row < TILE_H * 2; row++) {
+                for (int col = 0; col < TILE_W * 2; col++) {
+                    int p = (col / TILE_W) * 2 + (row / TILE_H);
+                    int t = base + p;
+                    if (t < 0 || t >= CHR_MAX_TILES) continue;
+                    uint8_t val = s->chr.px[t][row % TILE_H][col % TILE_W] & 3;
+                    SDL_Color c = get_display_color(s, t, val);
+                    fill(ren, preview_x + col * pix_sz, preview_y + row * pix_sz,
+                         pix_sz, pix_sz, c.r, c.g, c.b);
+                }
+            }
+        } else {
+            if (base >= 0 && base < CHR_MAX_TILES) {
+                for (int row = 0; row < TILE_H; row++) {
+                    for (int col = 0; col < TILE_W; col++) {
+                        uint8_t val = s->chr.px[base][row][col] & 3;
+                        SDL_Color c = get_display_color(s, base, val);
+                        fill(ren, preview_x + col * pix_sz, preview_y + row * pix_sz,
+                             pix_sz, pix_sz, c.r, c.g, c.b);
+                    }
+                }
+            }
+        }
+    }
+
+    /* Frame counter */
+    int counter_y = preview_y + preview_sz + 6;
+    if (s->anim_state == ANIM_ACTIVE) {
+        char cbuf[24];
+        snprintf(cbuf, sizeof(cbuf), "%d/%d", s->anim_cur + 1, s->anim_frame_count);
+        int cw = (int)strlen(cbuf) * font_char_w();
+        font_draw_str(ren, cbuf, BX + (s->panel_w - cw) / 2, counter_y, WHT);
+    }
+
+    /* Scrubber bar */
+    int scrub_y0 = counter_y + 14 + 6;
+    int scrub_x0 = BX + PANEL_PAL_X0;
+    int scrub_w  = s->panel_w - 2 * PANEL_PAL_X0;
+    fill(ren, scrub_x0, scrub_y0, scrub_w, PANEL_ANIM_SCRUB_H, 30, 30, 50);
+
+    if (s->anim_state == ANIM_ACTIVE && s->anim_frame_count > 1) {
+        int fill_w = s->anim_cur * scrub_w / (s->anim_frame_count - 1);
+        if (fill_w > 0)
+            fill(ren, scrub_x0, scrub_y0, fill_w, PANEL_ANIM_SCRUB_H, 0, 180, 220);
+        int knob_x = scrub_x0 + fill_w - 2;
+        if (knob_x < scrub_x0) knob_x = scrub_x0;
+        fill(ren, knob_x, scrub_y0 - 1, 4, PANEL_ANIM_SCRUB_H + 2, 0, 220, 255);
     }
 }
 
@@ -385,6 +593,8 @@ static void render_panel(SDL_Renderer *ren, const EditorState *s) {
         SDL_Color qcol = {200, 210, 240, 255};
         font_draw_char(ren, '?', BX + 22, panel_view_y0 + 1, qcol);
     }
+
+    render_anim_section(ren, s, panel_view_y0);
 }
 
 /* ── Help overlay ─────────────────────────────────────────────── */
@@ -507,6 +717,8 @@ void render_frame(SDL_Renderer *ren, const EditorState *s) {
     if (s->show_tile_grid)  render_tile_grid(ren, s);
 
     render_tile_highlight(ren, s);
+    render_anim_frame_highlight(ren, s);
+    render_anim_ghosts(ren, s);
     render_panel(ren, s);
     render_status(ren, s);
 

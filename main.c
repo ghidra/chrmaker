@@ -44,7 +44,16 @@ static void state_update_dims(EditorState *s) {
 
     /* Minimum panel height shifts down as the picker grows.            */
     int panel_view_y0 = PANEL_NES_Y0 + PANEL_NES_ROWS * nes_step + 10;
-    int panel_full_h  = panel_view_y0 + 44;
+    /* Animation preview size: 4 screen px per NES px at ×1, doubled at ×2.
+       sprite-8 → 32 or 64; sprite-16 → 64 or 128 (capped to panel width). */
+    int anim_nes_sz   = (s->sprite_mode == SPRITE_16 && s->chr_cols >= 2) ? 16 : 8;
+    int anim_pz       = (s->anim_preview_zoom >= 2) ? 2 : 1;
+    int anim_prev_sz  = anim_nes_sz * 4 * anim_pz;
+    int anim_max_prev = s->panel_w - 2 * PANEL_PAL_X0;
+    if (anim_prev_sz > anim_max_prev) anim_prev_sz = anim_max_prev;
+    /* label(12) + gap(4) + preview + gap(6) + counter(14) + gap(6) + scrub(8) + margins(16) */
+    int anim_section_h = anim_prev_sz + 66;
+    int panel_full_h  = panel_view_y0 + 44 + anim_section_h;
 
     s->win_w = s->canvas_w + s->panel_w;
     s->win_h = (s->canvas_h < panel_full_h ? panel_full_h : s->canvas_h)
@@ -61,6 +70,7 @@ static void state_init(EditorState *s, const char *path, int cols, int rows) {
     s->chr_cols        = cols;
     s->chr_rows        = rows;
     s->zoom            = 3;
+    s->anim_preview_zoom = 1;   /* must be set before state_update_dims */
     state_update_dims(s);
     s->want_resize     = false;
 
@@ -86,6 +96,13 @@ static void state_init(EditorState *s, const char *path, int cols, int rows) {
     s->want_save_pal    = false;
     s->want_load_pal    = false;
     s->running          = true;
+
+    s->anim_state        = ANIM_OFF;
+    s->anim_first        = 0;
+    s->anim_last         = 0;
+    s->anim_cur          = 0;
+    s->anim_frame_count  = 1;
+    /* anim_preview_zoom already set to 1 above before state_update_dims */
 
     snprintf(s->current_path, sizeof(s->current_path), "%s", path);
 }

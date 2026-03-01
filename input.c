@@ -7,6 +7,16 @@
 
 static int wmod(int v, int n) { return ((v % n) + n) % n; }
 
+static void anim_finish_pick(EditorState *s) {
+    int stride = (s->sprite_mode == SPRITE_16 && s->chr_cols >= 2) ? 4 : 1;
+    if (s->anim_last < s->anim_first) {
+        int tmp = s->anim_first; s->anim_first = s->anim_last; s->anim_last = tmp;
+    }
+    s->anim_frame_count = (s->anim_last - s->anim_first) / stride + 1;
+    s->anim_cur         = 0;
+    s->anim_state       = ANIM_ACTIVE;
+}
+
 /* Map screen coords to the tile index under the cursor.
    In sprite-16 mode the tile layout is remapped, so screen position
    does not equal (row*cols + col) — we compute the correct sub-tile. */
@@ -207,6 +217,42 @@ static void panel_click(EditorState *s, int px, int py) {
     if (py >= panel_view_y0 && py < panel_view_y0 + 16 &&
         px >= 22 && px < 34)
         s->show_help = !s->show_help;
+
+    /* Animation section hit-tests (preview + scrubber) */
+    {
+        bool s16        = (s->sprite_mode == SPRITE_16 && s->chr_cols >= 2);
+        int  nes_sz     = s16 ? 16 : 8;
+        int  pz         = (s->anim_preview_zoom >= 2) ? 2 : 1;
+        int  preview_sz = nes_sz * 4 * pz;
+        int  max_prev   = s->panel_w - 2 * PANEL_PAL_X0;
+        if (preview_sz > max_prev) preview_sz = max_prev;
+
+        int anim_y0   = panel_view_y0 + 44 + 8;
+        int preview_y = anim_y0 + 12 + 4;
+        int preview_x = (s->panel_w - preview_sz) / 2;  /* panel-relative */
+
+        /* Click preview → toggle zoom (×1 ↔ ×2) */
+        if (s->anim_state != ANIM_OFF &&
+            py >= preview_y && py < preview_y + preview_sz &&
+            px >= preview_x && px < preview_x + preview_sz) {
+            s->anim_preview_zoom = (s->anim_preview_zoom == 1) ? 2 : 1;
+            s->want_resize = true;
+            return;
+        }
+
+        /* Scrubber hit-test */
+        int scrub_y0 = preview_y + preview_sz + 6 + 14 + 6;
+        int scrub_x0 = PANEL_PAL_X0;
+        int scrub_w  = s->panel_w - 2 * PANEL_PAL_X0;
+        if (s->anim_state == ANIM_ACTIVE &&
+            py >= scrub_y0 && py < scrub_y0 + PANEL_ANIM_SCRUB_H &&
+            px >= scrub_x0 && px < scrub_x0 + scrub_w) {
+            int frame = (px - scrub_x0) * s->anim_frame_count / scrub_w;
+            if (frame < 0) frame = 0;
+            if (frame >= s->anim_frame_count) frame = s->anim_frame_count - 1;
+            s->anim_cur = frame;
+        }
+    }
 }
 
 /* ── Event dispatch ───────────────────────────────────────────── */
@@ -332,6 +378,23 @@ void input_handle(const SDL_Event *e, EditorState *s) {
                     break;
                 }
 
+                case SDLK_a:
+                    if (s->anim_state == ANIM_OFF)
+                        s->anim_state = ANIM_PICKING_FIRST;
+                    else
+                        s->anim_state = ANIM_OFF;
+                    break;
+
+                case SDLK_LEFT:
+                    if (s->anim_state == ANIM_ACTIVE && s->anim_cur > 0)
+                        s->anim_cur--;
+                    break;
+                case SDLK_RIGHT:
+                    if (s->anim_state == ANIM_ACTIVE &&
+                        s->anim_cur < s->anim_frame_count - 1)
+                        s->anim_cur++;
+                    break;
+
                 case SDLK_t: select_tile_under_cursor(s); break;
                 case SDLK_w:
                     s->wrap_mode = (WrapMode)((s->wrap_mode + 1) % 4);
@@ -363,8 +426,39 @@ void input_handle(const SDL_Event *e, EditorState *s) {
             s->mouse_x = mx; s->mouse_y = my;
             if (e->button.button == SDL_BUTTON_LEFT) {
                 s->mouse_down = true;
-                if (mx < s->canvas_w) paint_at(s, mx, my);
-                else                  panel_click(s, mx - s->canvas_w, my);
+                if (mx < s->canvas_w) {
+                    if (s->anim_state == ANIM_PICKING_FIRST ||
+                        s->anim_state == ANIM_PICKING_LAST) {
+                        int ntiles = s->chr_cols * s->chr_rows;
+                        int snapped;
+                        if (s->sprite_mode == SPRITE_16 && s->chr_cols >= 2) {
+                            /* In sprite-16 mode tiles are column-major remapped;
+                               use sprite-grid coords to get the correct base tile. */
+                            int nx = mx / s->zoom;
+                            int ny = my / s->zoom;
+                            int sprite_cols = s->chr_cols / 2;
+                            int sprite_x    = nx / (TILE_W * 2);
+                            int sprite_y    = ny / (TILE_H * 2);
+                            snapped = (sprite_y * sprite_cols + sprite_x) * 4;
+                        } else {
+                            snapped = (my / (s->zoom * TILE_H)) * s->chr_cols
+                                    + (mx / (s->zoom * TILE_W));
+                        }
+                        if (snapped < 0) snapped = 0;
+                        if (snapped >= ntiles) snapped = ntiles - 1;
+                        if (s->anim_state == ANIM_PICKING_FIRST) {
+                            s->anim_first = snapped;
+                            s->anim_state = ANIM_PICKING_LAST;
+                        } else {
+                            s->anim_last = snapped;
+                            anim_finish_pick(s);
+                        }
+                    } else {
+                        paint_at(s, mx, my);
+                    }
+                } else {
+                    panel_click(s, mx - s->canvas_w, my);
+                }
             }
             if (e->button.button == SDL_BUTTON_RIGHT) {
                 s->right_mouse_down = true;
@@ -382,8 +476,13 @@ void input_handle(const SDL_Event *e, EditorState *s) {
             int mx = e->motion.x, my = e->motion.y;
             s->mouse_x = mx; s->mouse_y = my;
             if (s->mouse_down) {
-                if (mx < s->canvas_w) paint_at(s, mx, my);
-                else                  panel_click(s, mx - s->canvas_w, my);
+                if (mx < s->canvas_w) {
+                    if (s->anim_state != ANIM_PICKING_FIRST &&
+                        s->anim_state != ANIM_PICKING_LAST)
+                        paint_at(s, mx, my);
+                } else {
+                    panel_click(s, mx - s->canvas_w, my);
+                }
             }
             if (s->right_mouse_down)
                 assign_pal_at(s, mx, my);

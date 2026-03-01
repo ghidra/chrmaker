@@ -21,6 +21,13 @@ typedef enum {
     SPRITE_16    /* 4 sequential tiles shown as 16×16: [0][2] / [1][3] */
 } SpriteMode;
 
+typedef enum {
+    ANIM_OFF,
+    ANIM_PICKING_FIRST,
+    ANIM_PICKING_LAST,
+    ANIM_ACTIVE
+} AnimState;
+
 typedef struct {
     ChrPage      chr;
     PaletteState pal;
@@ -78,6 +85,14 @@ typedef struct {
 
     /* Help overlay */
     bool         show_help;
+
+    /* Animation / onion-skin mode */
+    AnimState    anim_state;
+    int          anim_first;        /* tile index of first frame (stride-aligned) */
+    int          anim_last;         /* tile index of last frame  (stride-aligned) */
+    int          anim_cur;          /* current frame index (0-based)              */
+    int          anim_frame_count;  /* total number of frames                     */
+    int          anim_preview_zoom; /* preview scale: 1 or 2 (click preview to toggle) */
 
     /* Loop control */
     bool         running;
