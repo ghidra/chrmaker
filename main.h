@@ -86,6 +86,9 @@ typedef struct {
     /* Help overlay */
     bool         show_help;
 
+    /* Address overlay — show tile index + CHR byte offset in status bar */
+    bool         show_addr;
+
     /* Animation / onion-skin mode */
     AnimState    anim_state;
     int          anim_first;        /* tile index of first frame (stride-aligned) */

@@ -332,6 +332,22 @@ static void render_anim_ghosts(SDL_Renderer *ren, const EditorState *s) {
     }
 }
 
+/* ── Screen-to-tile (for address display) ─────────────────────── */
+static int screen_to_tile_idx(const EditorState *s, int mx, int my) {
+    int nx = mx / s->zoom;
+    int ny = my / s->zoom;
+    if (s->sprite_mode == SPRITE_16 && s->chr_cols >= 2) {
+        int sprite_cols = s->chr_cols / 2;
+        int sprite_x    = nx / (TILE_W * 2);
+        int sprite_y    = ny / (TILE_H * 2);
+        int sub_x       = (nx / TILE_W) % 2;
+        int sub_y       = (ny / TILE_H) % 2;
+        int p           = sub_x * 2 + sub_y;
+        return (sprite_y * sprite_cols + sprite_x) * 4 + p;
+    }
+    return (ny / TILE_H) * s->chr_cols + (nx / TILE_W);
+}
+
 /* ── Status bar ───────────────────────────────────────────────── */
 static void render_status(SDL_Renderer *ren, const EditorState *s) {
     const int STATUS_Y = s->win_h - STATUS_H;
@@ -368,6 +384,23 @@ static void render_status(SDL_Renderer *ren, const EditorState *s) {
         hline(ren, tx + 1, SY + SH / 2, SW - 2, 0, 0, 0);
     if (s->wrap_mode == WRAP_V || s->wrap_mode == WRAP_BOTH)
         vline(ren, tx + SW / 2, SY + 1, SH - 2, 0, 0, 0);
+
+    /* Tile address display — shows tile index + CHR byte offset under cursor */
+    if (s->show_addr) {
+        int mx = s->mouse_x, my = s->mouse_y;
+        int ty_addr = STATUS_Y + (STATUS_H - font_line_h()) / 2 + 1;
+        if (mx >= 0 && mx < s->canvas_w && my >= 0 && my < s->canvas_h) {
+            int tile = screen_to_tile_idx(s, mx, my);
+            int addr = tile * 16;
+            char abuf[24];
+            snprintf(abuf, sizeof(abuf), "#$%02X @$%04X", tile, addr);
+            static const SDL_Color ACOL = {180, 220, 160, 255};
+            font_draw_str(ren, abuf, 96, ty_addr, ACOL);
+        } else {
+            static const SDL_Color DCOL = {80, 80, 100, 255};
+            font_draw_str(ren, "N:ADDR", 96, ty_addr, DCOL);
+        }
+    }
 
     /* Zoom and sprite-mode indicators — right-aligned so they always fit. */
     {
@@ -637,7 +670,8 @@ static void render_help_overlay(SDL_Renderer *ren, const EditorState *s) {
     font_draw_str(ren, " V      GRAYSCALE / NES COLOUR",  x, y, WHT); y += lh;
     font_draw_str(ren, " G      TILE GRID",               x, y, WHT); y += lh;
     font_draw_str(ren, " P      PIXEL GRID",              x, y, WHT); y += lh;
-    font_draw_str(ren, " M      SPRITE 16 MODE",          x, y, WHT); y += lh + hg;
+    font_draw_str(ren, " M      SPRITE 16 MODE",          x, y, WHT); y += lh;
+    font_draw_str(ren, " N      SHOW TILE ADDRESS",        x, y, WHT); y += lh + hg;
 
     font_draw_str(ren, "FILES & CANVAS",                  x, y, CYN); y += lh;
     font_draw_str(ren, " CTRL+S      SAVE",               x, y, WHT); y += lh;

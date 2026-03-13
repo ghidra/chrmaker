@@ -49,6 +49,30 @@ All dimensions are runtime — no compile-time canvas constants. Call `state_upd
 
 When `sprite_mode == SPRITE_16`, 4 sequential tiles are displayed as one 16×16 sprite: layout is `[0][2] / [1][3]` (column-major). `screen_to_tile` and `sel_tile_idx` both account for this remapping. Operations that affect a selected sprite (palette assign, `[`/`]` cycling, right-click) always apply to all 4 sub-tiles.
 
+## Sprite generation (Claude scripting)
+
+`chrgen.py` converts inline JSON sprite definitions to raw NES CHR binary. No intermediate files — Claude pipes pixel data directly via heredoc:
+
+```bash
+python3 /home/jimmy/projects/nes/chrmaker/chrgen.py output.chr << 'EOF'
+[
+  { "size": 16, "pixels": ["0000011111100000", ...] },
+  { "size":  8, "pixels": ["00111100", ...] }
+]
+EOF
+```
+
+- `size: 8` → 1 tile; `size: 16` → 4 tiles in S16 column-major order (TL/BL/TR/BR)
+- Pixel values `0`–`3` are NES bitplane indices (never RGB)
+- Output is always padded to 256 tiles (4096 bytes)
+- Status goes to stderr only; file is immediately openable with `./chrmaker output.chr`
+
+**Color convention used by Claude when drawing:**
+- `0` = transparent / background
+- `1` = dark outline / shadow
+- `2` = mid-tone fill (suit, skin, main body colour)
+- `3` = bright highlight / accent (visor, glow, detail)
+
 ## Keyboard shortcuts (reference)
 
 | Key | Action |

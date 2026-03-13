@@ -378,6 +378,8 @@ void input_handle(const SDL_Event *e, EditorState *s) {
                     break;
                 }
 
+                case SDLK_n: s->show_addr = !s->show_addr; break;
+
                 case SDLK_a:
                     if (s->anim_state == ANIM_OFF)
                         s->anim_state = ANIM_PICKING_FIRST;
