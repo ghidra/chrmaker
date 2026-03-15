@@ -38,3 +38,6 @@
 /* Preview size and section height are computed at runtime from
    sprite_mode and anim_preview_zoom — see state_update_dims().   */
 #define PANEL_ANIM_SCRUB_H  8    /* scrubber bar height in px (fixed)      */
+
+/* ── Section 5: Tile edit mode (replaces normal panel when active) ── */
+#define PANEL_EDIT_MARGIN   4    /* margin around enlarged tile in panel */

@@ -111,6 +111,41 @@ static void input_cancel(EditorState *s) {
     SDL_StopTextInput();
 }
 
+/* ── Tile edit paint (enlarged tile in panel) ─────────────────── */
+
+static void tile_edit_paint(EditorState *s, int px, int py) {
+    bool s16 = (s->sprite_mode == SPRITE_16 && s->chr_cols >= 2);
+    int edit_dim = s16 ? 16 : 8;
+    int pixel_sz = (s->panel_w - 2 * PANEL_EDIT_MARGIN) / edit_dim;
+    int edit_sz  = pixel_sz * edit_dim;
+    int edit_x0  = (s->panel_w - edit_sz) / 2;
+    int edit_y0  = PANEL_EDIT_MARGIN + 20;
+
+    if (px < edit_x0 || px >= edit_x0 + edit_sz ||
+        py < edit_y0 || py >= edit_y0 + edit_sz) return;
+
+    int lx = (px - edit_x0) / pixel_sz;
+    int ly = (py - edit_y0) / pixel_sz;
+
+    bool wx = (s->wrap_mode == WRAP_H || s->wrap_mode == WRAP_BOTH);
+    bool wy = (s->wrap_mode == WRAP_V || s->wrap_mode == WRAP_BOTH);
+
+    if (s16) {
+        if (wx) lx = wmod(lx, 16); else if (lx < 0 || lx >= 16) return;
+        if (wy) ly = wmod(ly, 16); else if (ly < 0 || ly >= 16) return;
+        int sub_x = lx / TILE_W;
+        int sub_y = ly / TILE_H;
+        int p     = sub_x * 2 + sub_y;
+        int tile  = sel_tile_idx(s) + p;
+        s->chr.px[tile][ly % TILE_H][lx % TILE_W] = (uint8_t)s->color;
+    } else {
+        if (wx) lx = wmod(lx, 8); else if (lx < 0 || lx >= 8) return;
+        if (wy) ly = wmod(ly, 8); else if (ly < 0 || ly >= 8) return;
+        int tile = sel_tile_idx(s);
+        s->chr.px[tile][ly][lx] = (uint8_t)s->color;
+    }
+}
+
 /* ── Paint ────────────────────────────────────────────────────── */
 
 static void paint_at(EditorState *s, int mx, int my) {
@@ -303,9 +338,10 @@ void input_handle(const SDL_Event *e, EditorState *s) {
             switch (e->key.keysym.sym) {
 
                 case SDLK_ESCAPE:
-                    if (s->show_help)    s->show_help = false;
+                    if (s->show_help)      s->show_help = false;
+                    else if (s->tile_edit) s->tile_edit = false;
                     else if (s->tile_mode) s->tile_mode = false;
-                    else                 s->running   = false;
+                    else                   s->running   = false;
                     break;
 
                 case SDLK_0: s->color = 0; break;
@@ -356,6 +392,8 @@ void input_handle(const SDL_Event *e, EditorState *s) {
                 case SDLK_e:
                     if (e->key.keysym.mod & KMOD_CTRL)
                         s->want_save = true;
+                    else if (s->tile_mode && !s->tile_edit)
+                        s->tile_edit = true;
                     break;
 
                 case SDLK_EQUALS:
@@ -371,9 +409,11 @@ void input_handle(const SDL_Event *e, EditorState *s) {
                     if (s->sprite_mode == SPRITE_16) {
                         s->sprite_mode = SPRITE_8;
                         s->tile_mode   = false;
+                        s->tile_edit   = false;
                     } else if (can) {
                         s->sprite_mode = SPRITE_16;
                         s->tile_mode   = false;
+                        s->tile_edit   = false;
                     }
                     break;
                 }
@@ -459,7 +499,10 @@ void input_handle(const SDL_Event *e, EditorState *s) {
                         paint_at(s, mx, my);
                     }
                 } else {
-                    panel_click(s, mx - s->canvas_w, my);
+                    if (s->tile_edit)
+                        tile_edit_paint(s, mx - s->canvas_w, my);
+                    else
+                        panel_click(s, mx - s->canvas_w, my);
                 }
             }
             if (e->button.button == SDL_BUTTON_RIGHT) {
@@ -483,7 +526,10 @@ void input_handle(const SDL_Event *e, EditorState *s) {
                         s->anim_state != ANIM_PICKING_LAST)
                         paint_at(s, mx, my);
                 } else {
-                    panel_click(s, mx - s->canvas_w, my);
+                    if (s->tile_edit)
+                        tile_edit_paint(s, mx - s->canvas_w, my);
+                    else
+                        panel_click(s, mx - s->canvas_w, my);
                 }
             }
             if (s->right_mouse_down)

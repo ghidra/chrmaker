@@ -60,6 +60,7 @@ typedef struct {
 
     /* Tile-wrap painting mode */
     bool         tile_mode;
+    bool         tile_edit;         /* enlarged tile editor in panel        */
     int          sel_tile_x;        /* tile col of selection (sprite16: always even) */
     int          sel_tile_y;        /* tile row of selection (sprite16: always even) */
     WrapMode     wrap_mode;

@@ -419,6 +419,11 @@ static void render_status(SDL_Renderer *ren, const EditorState *s) {
             static const SDL_Color S16COL = {80, 210, 140, 255};
             font_draw_str(ren, "S16", ind_x, ty_ind, S16COL);
         }
+        if (s->tile_edit) {
+            ind_x -= 4 * cw + 4;
+            static const SDL_Color EDITCOL = {255, 210, 40, 255};
+            font_draw_str(ren, "EDIT", ind_x, ty_ind, EDITCOL);
+        }
         if (s->anim_state != ANIM_OFF) {
             ind_x -= 4 * cw + 4;
             static const SDL_Color ANIMCOL = {0, 200, 255, 255};
@@ -527,6 +532,103 @@ static void render_anim_section(SDL_Renderer *ren, const EditorState *s,
         if (knob_x < scrub_x0) knob_x = scrub_x0;
         fill(ren, knob_x, scrub_y0 - 1, 4, PANEL_ANIM_SCRUB_H + 2, 0, 220, 255);
     }
+}
+
+/* Index of the top-left tile of the currently selected tile/sprite (render-side). */
+static int sel_tile_idx_r(const EditorState *s) {
+    if (s->sprite_mode == SPRITE_16 && s->chr_cols >= 2)
+        return ((s->sel_tile_y / 2) * (s->chr_cols / 2) + (s->sel_tile_x / 2)) * 4;
+    return s->sel_tile_y * s->chr_cols + s->sel_tile_x;
+}
+
+/* ── Tile edit panel (enlarged tile view for drawing) ─────────── */
+
+static void render_tile_edit_panel(SDL_Renderer *ren, const EditorState *s) {
+    const int BX = s->canvas_w;
+
+    fill(ren, BX, 0, s->panel_w, s->win_h - STATUS_H, 18, 18, 30);
+
+    static const SDL_Color YLW = {220, 195, 50, 255};
+    static const SDL_Color DIM = {100, 100, 130, 255};
+    font_draw_str(ren, "TILE EDIT", BX + PANEL_EDIT_MARGIN, PANEL_EDIT_MARGIN, YLW);
+
+    bool s16 = (s->sprite_mode == SPRITE_16 && s->chr_cols >= 2);
+    int edit_dim = s16 ? 16 : 8;
+    int pixel_sz = (s->panel_w - 2 * PANEL_EDIT_MARGIN) / edit_dim;
+    int edit_sz  = pixel_sz * edit_dim;
+    int edit_x0  = BX + (s->panel_w - edit_sz) / 2;
+    int edit_y0  = PANEL_EDIT_MARGIN + 20;
+
+    int base = sel_tile_idx_r(s);
+
+    /* Draw enlarged tile pixels */
+    for (int py = 0; py < edit_dim; py++) {
+        for (int px = 0; px < edit_dim; px++) {
+            int tile, lr, lc;
+            if (s16) {
+                int sub_x = px / TILE_W;
+                int sub_y = py / TILE_H;
+                int p = sub_x * 2 + sub_y;
+                tile = base + p;
+                lr = py % TILE_H;
+                lc = px % TILE_W;
+            } else {
+                tile = base;
+                lr = py;
+                lc = px;
+            }
+            uint8_t val = s->chr.px[tile][lr][lc] & 3;
+            SDL_Color c = get_display_color(s, tile, val);
+            fill(ren, edit_x0 + px * pixel_sz, edit_y0 + py * pixel_sz,
+                 pixel_sz, pixel_sz, c.r, c.g, c.b);
+        }
+    }
+
+    /* Pixel grid */
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(ren, 80, 80, 110, 100);
+    for (int i = 1; i < edit_dim; i++) {
+        int x = edit_x0 + i * pixel_sz;
+        SDL_RenderDrawLine(ren, x, edit_y0, x, edit_y0 + edit_sz - 1);
+        int y = edit_y0 + i * pixel_sz;
+        SDL_RenderDrawLine(ren, edit_x0, y, edit_x0 + edit_sz - 1, y);
+    }
+    /* Tile boundary lines for sprite-16 */
+    if (s16) {
+        SDL_SetRenderDrawColor(ren, 60, 100, 200, 180);
+        int mid_x = edit_x0 + TILE_W * pixel_sz;
+        SDL_RenderDrawLine(ren, mid_x, edit_y0, mid_x, edit_y0 + edit_sz - 1);
+        int mid_y = edit_y0 + TILE_H * pixel_sz;
+        SDL_RenderDrawLine(ren, edit_x0, mid_y, edit_x0 + edit_sz - 1, mid_y);
+    }
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+
+    /* Amber border */
+    SDL_SetRenderDrawColor(ren, 255, 210, 40, 255);
+    SDL_Rect border = { edit_x0 - 1, edit_y0 - 1, edit_sz + 2, edit_sz + 2 };
+    SDL_RenderDrawRect(ren, &border);
+
+    /* Colour swatches */
+    int sw_y  = edit_y0 + edit_sz + 8;
+    int sw_sz = 14;
+    for (int i = 0; i < 4; i++) {
+        int sx = edit_x0 + i * (sw_sz + 3);
+        if (i == s->color)
+            fill(ren, sx - 1, sw_y - 1, sw_sz + 2, sw_sz + 2, 220, 220, 220);
+        SDL_Color c = get_display_color(s, base, i);
+        fill(ren, sx, sw_y, sw_sz, sw_sz, c.r, c.g, c.b);
+    }
+
+    /* Wrap mode label */
+    const char *wlabel = "WRAP:NONE";
+    if (s->wrap_mode == WRAP_H)    wlabel = "WRAP:H";
+    if (s->wrap_mode == WRAP_V)    wlabel = "WRAP:V";
+    if (s->wrap_mode == WRAP_BOTH) wlabel = "WRAP:HV";
+    font_draw_str(ren, wlabel, edit_x0, sw_y + sw_sz + 8, DIM);
+
+    /* Hints */
+    font_draw_str(ren, "ESC:BACK  W:WRAP", BX + PANEL_EDIT_MARGIN,
+                  s->win_h - STATUS_H - font_line_h() - 4, DIM);
 }
 
 /* ── Palette panel ────────────────────────────────────────────── */
@@ -663,6 +765,7 @@ static void render_help_overlay(SDL_Renderer *ren, const EditorState *s) {
     font_draw_str(ren, "TILE MODE",                       x, y, CYN); y += lh;
     font_draw_str(ren, " T      SELECT TILE",             x, y, WHT); y += lh;
     font_draw_str(ren, " W      CYCLE WRAP MODE",         x, y, WHT); y += lh;
+    font_draw_str(ren, " E      TILE EDIT (PANEL)",       x, y, WHT); y += lh;
     font_draw_str(ren, " [/]    CYCLE TILE PALETTE",      x, y, WHT); y += lh;
     font_draw_str(ren, " ESC    EXIT TILE MODE",          x, y, WHT); y += lh + hg;
 
@@ -753,7 +856,10 @@ void render_frame(SDL_Renderer *ren, const EditorState *s) {
     render_tile_highlight(ren, s);
     render_anim_frame_highlight(ren, s);
     render_anim_ghosts(ren, s);
-    render_panel(ren, s);
+    if (s->tile_edit)
+        render_tile_edit_panel(ren, s);
+    else
+        render_panel(ren, s);
     render_status(ren, s);
 
     vline(ren, s->canvas_w, 0,                   s->win_h - STATUS_H, 55, 55, 80);
