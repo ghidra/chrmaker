@@ -112,6 +112,7 @@ typedef struct {
     ComposeLayer compose_layer;
     int          brush_tile;          /* selected tile from CHR picker       */
     bool         brush_hflip, brush_vflip;  /* sprite-only flip state        */
+    bool         brush_s16;           /* place 16×16 sprites (vs 8×8)        */
     int          compose_zoom;        /* 1-3, default 2                      */
     int          compose_canvas_w;    /* 256 * compose_zoom                  */
     int          compose_canvas_h;    /* 240 * compose_zoom                  */

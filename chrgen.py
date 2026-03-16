@@ -89,13 +89,14 @@ def load_existing(path):
     return tiles
 
 
-def find_first_free(tiles):
-    """Return the index of the first blank tile (all zeroes)."""
+def find_insert_point(tiles):
+    """Return the index after the last non-blank tile."""
     blank = bytes(TILE_BYTES)
+    last_used = -1
     for i, t in enumerate(tiles):
-        if t == blank:
-            return i
-    return len(tiles)
+        if t != blank:
+            last_used = i
+    return last_used + 1
 
 
 def main():
@@ -127,7 +128,7 @@ def main():
     while len(existing) < MAX_TILES:
         existing.append(blank)
 
-    insert_at = find_first_free(existing)
+    insert_at = find_insert_point(existing)
     n_new = len(new_tiles)
 
     if insert_at + n_new > MAX_TILES:

@@ -26,9 +26,9 @@ int compose_save(const ComposeData *d, const char *path) {
     FILE *f = fopen(path, "wb");
     if (!f) return -1;
 
-    /* Header */
+    /* Header — version 2: uint16_t nametable entries */
     fwrite("NSCN", 1, 4, f);
-    uint8_t ver = 1;
+    uint8_t ver = 2;
     fwrite(&ver, 1, 1, f);
     uint8_t sc = (uint8_t)d->scene_count;
     fwrite(&sc, 1, 1, f);
@@ -36,8 +36,15 @@ int compose_save(const ComposeData *d, const char *path) {
     for (int i = 0; i < d->scene_count; i++) {
         const ComposeScene *s = &d->scenes[i];
 
-        /* Nametable: 960 bytes */
-        fwrite(s->nametable, 1, COMPOSE_NT_W * COMPOSE_NT_H, f);
+        /* Nametable: 1920 bytes (32×30 × 2 bytes, little-endian) */
+        for (int r = 0; r < COMPOSE_NT_H; r++) {
+            for (int c = 0; c < COMPOSE_NT_W; c++) {
+                uint8_t lo = (uint8_t)(s->nametable[r][c] & 0xFF);
+                uint8_t hi = (uint8_t)((s->nametable[r][c] >> 8) & 0xFF);
+                fwrite(&lo, 1, 1, f);
+                fwrite(&hi, 1, 1, f);
+            }
+        }
 
         /* Attributes: 240 bytes */
         fwrite(s->attr, 1, 15 * 16, f);
@@ -56,7 +63,8 @@ int compose_save(const ComposeData *d, const char *path) {
             buf[4] = sp->palette;
             buf[5] = (sp->hflip ? 1 : 0)
                     | (sp->vflip ? 2 : 0)
-                    | (sp->behind_bg ? 4 : 0);
+                    | (sp->behind_bg ? 4 : 0)
+                    | (sp->s16 ? 8 : 0);
             fwrite(buf, 1, 6, f);
         }
     }
@@ -75,7 +83,7 @@ int compose_load(ComposeData *d, const char *path) {
     }
 
     uint8_t ver, sc;
-    if (fread(&ver, 1, 1, f) != 1 || ver != 1) { fclose(f); return -1; }
+    if (fread(&ver, 1, 1, f) != 1 || (ver != 1 && ver != 2)) { fclose(f); return -1; }
     if (fread(&sc, 1, 1, f) != 1 || sc < 1 || sc > COMPOSE_MAX_SCENES) {
         fclose(f); return -1;
     }
@@ -86,8 +94,23 @@ int compose_load(ComposeData *d, const char *path) {
     for (int i = 0; i < sc; i++) {
         ComposeScene *s = &d->scenes[i];
 
-        if (fread(s->nametable, 1, COMPOSE_NT_W * COMPOSE_NT_H, f) !=
-            COMPOSE_NT_W * COMPOSE_NT_H) { fclose(f); return -1; }
+        if (ver == 1) {
+            /* v1: 1 byte per nametable entry */
+            uint8_t nt8[COMPOSE_NT_H * COMPOSE_NT_W];
+            if (fread(nt8, 1, sizeof(nt8), f) != sizeof(nt8)) { fclose(f); return -1; }
+            for (int r = 0; r < COMPOSE_NT_H; r++)
+                for (int c = 0; c < COMPOSE_NT_W; c++)
+                    s->nametable[r][c] = nt8[r * COMPOSE_NT_W + c];
+        } else {
+            /* v2: 2 bytes per nametable entry (little-endian) */
+            for (int r = 0; r < COMPOSE_NT_H; r++) {
+                for (int c = 0; c < COMPOSE_NT_W; c++) {
+                    uint8_t pair[2];
+                    if (fread(pair, 1, 2, f) != 2) { fclose(f); return -1; }
+                    s->nametable[r][c] = pair[0] | ((uint16_t)pair[1] << 8);
+                }
+            }
+        }
 
         if (fread(s->attr, 1, 15 * 16, f) != 15 * 16) { fclose(f); return -1; }
 
@@ -107,6 +130,7 @@ int compose_load(ComposeData *d, const char *path) {
             sp->hflip     = (buf[5] & 1) != 0;
             sp->vflip     = (buf[5] & 2) != 0;
             sp->behind_bg = (buf[5] & 4) != 0;
+            sp->s16       = (buf[5] & 8) != 0;
         }
     }
 

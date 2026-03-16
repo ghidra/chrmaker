@@ -153,6 +153,7 @@ static void state_init(EditorState *s, const char *path, int cols, int rows) {
     s->brush_tile         = 0;
     s->brush_hflip        = false;
     s->brush_vflip        = false;
+    s->brush_s16          = false;
     s->compose_zoom       = 2;
     s->compose_hover_x    = -1;
     s->compose_hover_y    = -1;

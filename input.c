@@ -4,6 +4,74 @@
 #include <string.h>
 #include <stdio.h>
 
+/* ── Undo / redo ring buffer ──────────────────────────────────── */
+
+#define UNDO_MAX 64
+
+typedef struct {
+    ChrPage      chr;
+    PaletteState pal;
+    ComposeScene scene;
+    int          active_scene;
+} UndoEntry;
+
+static UndoEntry undo_buf[UNDO_MAX];
+static int undo_head  = 0;   /* next write slot                          */
+static int undo_count = 0;   /* valid entries behind head                */
+static int undo_redo  = 0;   /* redo entries ahead of current position   */
+
+static void undo_push(const EditorState *s) {
+    UndoEntry *e = &undo_buf[undo_head];
+    e->chr          = s->chr;
+    e->pal          = s->pal;
+    e->active_scene = s->compose.active_scene;
+    e->scene        = s->compose.scenes[s->compose.active_scene];
+    undo_head = (undo_head + 1) % UNDO_MAX;
+    if (undo_count < UNDO_MAX) undo_count++;
+    undo_redo = 0;   /* new action invalidates redo history */
+}
+
+static void undo_pop(EditorState *s) {
+    if (undo_count == 0) return;
+    /* Save current state for redo before restoring */
+    int redo_slot = undo_head;
+    UndoEntry *re = &undo_buf[redo_slot];
+    re->chr          = s->chr;
+    re->pal          = s->pal;
+    re->active_scene = s->compose.active_scene;
+    re->scene        = s->compose.scenes[s->compose.active_scene];
+
+    undo_head = (undo_head - 1 + UNDO_MAX) % UNDO_MAX;
+    undo_count--;
+    undo_redo++;
+
+    UndoEntry *e = &undo_buf[undo_head];
+    s->chr = e->chr;
+    s->pal = e->pal;
+    s->compose.scenes[e->active_scene] = e->scene;
+}
+
+static void undo_redo_pop(EditorState *s) {
+    if (undo_redo == 0) return;
+    int redo_slot = (undo_head + 1) % UNDO_MAX;
+    UndoEntry *e = &undo_buf[redo_slot];
+
+    /* Push current state so undo still works */
+    UndoEntry *cur = &undo_buf[undo_head];
+    cur->chr          = s->chr;
+    cur->pal          = s->pal;
+    cur->active_scene = s->compose.active_scene;
+    cur->scene        = s->compose.scenes[s->compose.active_scene];
+
+    s->chr = e->chr;
+    s->pal = e->pal;
+    s->compose.scenes[e->active_scene] = e->scene;
+
+    undo_head = redo_slot;
+    undo_count++;
+    undo_redo--;
+}
+
 /* ── Helpers ──────────────────────────────────────────────────── */
 
 static int wmod(int v, int n) { return ((v % n) + n) % n; }
@@ -398,7 +466,7 @@ static void compose_canvas_click(EditorState *s, int mx, int my, bool left, bool
                 sc->nametable[tile_y][tile_x] = 0;
             } else {
                 /* Place tile */
-                sc->nametable[tile_y][tile_x] = (uint8_t)(s->brush_tile & 0xFF);
+                sc->nametable[tile_y][tile_x] = (uint16_t)s->brush_tile;
                 /* Auto-set attribute for this 2x2 block */
                 int ax = tile_x / 2;
                 int ay = tile_y / 2;
@@ -420,10 +488,10 @@ static void compose_canvas_click(EditorState *s, int mx, int my, bool left, bool
 
         if (left) {
             /* Check if clicking on existing sprite */
-            int spr_w = (s->sprite_mode == SPRITE_16) ? 16 : 8;
-            int spr_h = (s->sprite_mode == SPRITE_16) ? 16 : 8;
             for (int i = sc->sprite_count - 1; i >= 0; i--) {
                 ComposeSprite *sp = &sc->sprites[i];
+                int spr_w = sp->s16 ? 16 : 8;
+                int spr_h = sp->s16 ? 16 : 8;
                 if (px_x >= sp->x && px_x < sp->x + spr_w &&
                     px_y >= sp->y && px_y < sp->y + spr_h) {
                     s->compose_spr_sel  = i;
@@ -444,14 +512,15 @@ static void compose_canvas_click(EditorState *s, int mx, int my, bool left, bool
                 sp->hflip   = s->brush_hflip;
                 sp->vflip   = s->brush_vflip;
                 sp->behind_bg = false;
+                sp->s16     = s->brush_s16;
                 s->compose_spr_sel = idx;
             }
         } else {
             /* Right-click: delete sprite under cursor */
-            int spr_w = (s->sprite_mode == SPRITE_16) ? 16 : 8;
-            int spr_h = (s->sprite_mode == SPRITE_16) ? 16 : 8;
             for (int i = sc->sprite_count - 1; i >= 0; i--) {
                 ComposeSprite *sp = &sc->sprites[i];
+                int spr_w = sp->s16 ? 16 : 8;
+                int spr_h = sp->s16 ? 16 : 8;
                 if (px_x >= sp->x && px_x < sp->x + spr_w &&
                     px_y >= sp->y && px_y < sp->y + spr_h) {
                     /* Remove by shifting */
@@ -508,6 +577,9 @@ static void compose_input(const SDL_Event *e, EditorState *s) {
                     if (s->compose_layer == COMPOSE_SPR)
                         s->brush_vflip = !s->brush_vflip;
                     break;
+                case SDLK_m:
+                    s->brush_s16 = !s->brush_s16;
+                    break;
                 case SDLK_g:
                     s->compose_show_attr_grid = !s->compose_show_attr_grid;
                     break;
@@ -547,12 +619,25 @@ static void compose_input(const SDL_Event *e, EditorState *s) {
                         }
                     }
                     break;
+                case SDLK_z:
+                    if (e->key.keysym.mod & KMOD_CTRL) {
+                        if (e->key.keysym.mod & KMOD_SHIFT)
+                            undo_redo_pop(s);
+                        else
+                            undo_pop(s);
+                    }
+                    break;
+                case SDLK_y:
+                    if (e->key.keysym.mod & KMOD_CTRL)
+                        undo_redo_pop(s);
+                    break;
                 case SDLK_s:
                     if (e->key.keysym.mod & KMOD_CTRL)
                         s->want_save_scene = true;
                     break;
                 case SDLK_DELETE:
                     if (s->compose_spr_sel >= 0) {
+                        undo_push(s);
                         ComposeScene *sc = active_scene(s);
                         int i = s->compose_spr_sel;
                         for (int j = i; j < sc->sprite_count - 1; j++)
@@ -600,8 +685,10 @@ static void compose_input(const SDL_Event *e, EditorState *s) {
             if (right) s->right_mouse_down = true;
 
             if (mx < cw && my < ch) {
-                if (left || right)
+                if (left || right) {
+                    undo_push(s);
                     compose_canvas_click(s, mx, my, left, shift);
+                }
             } else if (mx >= cw) {
                 if (left)
                     compose_panel_click(s, mx - cw, my);
@@ -716,6 +803,19 @@ void input_handle(const SDL_Event *e, EditorState *s) {
                     else                   s->running   = false;
                     break;
 
+                case SDLK_z:
+                    if (e->key.keysym.mod & KMOD_CTRL) {
+                        if (e->key.keysym.mod & KMOD_SHIFT)
+                            undo_redo_pop(s);
+                        else
+                            undo_pop(s);
+                    }
+                    break;
+                case SDLK_y:
+                    if (e->key.keysym.mod & KMOD_CTRL)
+                        undo_redo_pop(s);
+                    break;
+
                 case SDLK_0: s->color = 0; break;
                 case SDLK_1: s->color = 1; break;
                 case SDLK_2: s->color = 2; break;
@@ -736,6 +836,7 @@ void input_handle(const SDL_Event *e, EditorState *s) {
                     if ((e->key.keysym.mod & KMOD_CTRL) && s->tile_mode) {
                         clipboard_load(s);  /* refresh from file (cross-instance) */
                         if (s->has_clipboard) {
+                            undo_push(s);
                             int base = sel_tile_idx(s);
                             bool s16 = (s->sprite_mode == SPRITE_16 && s->chr_cols >= 2);
                             int cnt  = (s16 && s->clipboard_s16) ? 4 : 1;
@@ -786,6 +887,7 @@ void input_handle(const SDL_Event *e, EditorState *s) {
                     break;
                 case SDLK_x:
                     if ((e->key.keysym.mod & KMOD_CTRL) && s->tile_mode) {
+                        undo_push(s);
                         int base = sel_tile_idx(s);
                         bool s16 = (s->sprite_mode == SPRITE_16 && s->chr_cols >= 2);
                         int cnt  = s16 ? 4 : 1;
@@ -862,6 +964,7 @@ void input_handle(const SDL_Event *e, EditorState *s) {
 
                 case SDLK_LEFTBRACKET:
                     if (s->tile_mode) {
+                        undo_push(s);
                         int base = sel_tile_idx(s);
                         int cnt  = (s->sprite_mode == SPRITE_16 && s->chr_cols >= 2) ? 4 : 1;
                         for (int p = 0; p < cnt; p++)
@@ -870,6 +973,7 @@ void input_handle(const SDL_Event *e, EditorState *s) {
                     break;
                 case SDLK_RIGHTBRACKET:
                     if (s->tile_mode) {
+                        undo_push(s);
                         int base = sel_tile_idx(s);
                         int cnt  = (s->sprite_mode == SPRITE_16 && s->chr_cols >= 2) ? 4 : 1;
                         for (int p = 0; p < cnt; p++)
@@ -886,6 +990,13 @@ void input_handle(const SDL_Event *e, EditorState *s) {
             s->mouse_x = mx; s->mouse_y = my;
             if (e->button.button == SDL_BUTTON_LEFT) {
                 s->mouse_down = true;
+                /* Push undo before any canvas modification */
+                if (mx < s->canvas_w &&
+                    s->anim_state != ANIM_PICKING_FIRST &&
+                    s->anim_state != ANIM_PICKING_LAST)
+                    undo_push(s);
+                else if (mx >= s->canvas_w && s->tile_edit)
+                    undo_push(s);
                 if (mx < s->canvas_w) {
                     if (s->anim_state == ANIM_PICKING_FIRST ||
                         s->anim_state == ANIM_PICKING_LAST) {
@@ -925,6 +1036,7 @@ void input_handle(const SDL_Event *e, EditorState *s) {
             }
             if (e->button.button == SDL_BUTTON_RIGHT) {
                 s->right_mouse_down = true;
+                if (mx < s->canvas_w) undo_push(s);
                 assign_pal_at(s, mx, my);
             }
             break;
