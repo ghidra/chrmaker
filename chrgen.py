@@ -74,6 +74,30 @@ def split_s16(pixels):
     ]
 
 
+def load_existing(path):
+    """Load existing tiles from a CHR file, returning a list of 16-byte tiles."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except FileNotFoundError:
+        return []
+    tiles = []
+    for i in range(0, len(data), TILE_BYTES):
+        chunk = data[i:i + TILE_BYTES]
+        if len(chunk) == TILE_BYTES:
+            tiles.append(chunk)
+    return tiles
+
+
+def find_first_free(tiles):
+    """Return the index of the first blank tile (all zeroes)."""
+    blank = bytes(TILE_BYTES)
+    for i, t in enumerate(tiles):
+        if t == blank:
+            return i
+    return len(tiles)
+
+
 def main():
     if len(sys.argv) != 2:
         print(f"usage: {sys.argv[0]} <output.chr>", file=sys.stderr)
@@ -82,34 +106,46 @@ def main():
     output_path = sys.argv[1]
     sprites = json.load(sys.stdin)
 
-    tiles = []
+    new_tiles = []
     for i, sprite in enumerate(sprites):
         size   = sprite.get("size", 8)
         pixels = sprite["pixels"]
         if size == 8:
-            tiles.append(encode_tile(pixels))
+            new_tiles.append(encode_tile(pixels))
         elif size == 16:
             for quad in split_s16(pixels):
-                tiles.append(encode_tile(quad))
+                new_tiles.append(encode_tile(quad))
         else:
             print(f"sprite {i}: unknown size {size}", file=sys.stderr)
             sys.exit(1)
 
-    n_tiles = len(tiles)
-    if n_tiles > MAX_TILES:
-        print(f"warning: {n_tiles} tiles exceeds {MAX_TILES}, truncating", file=sys.stderr)
-        tiles = tiles[:MAX_TILES]
-
+    # Load existing file and inject after last used tile
+    existing = load_existing(output_path)
     blank = bytes(TILE_BYTES)
-    while len(tiles) < MAX_TILES:
-        tiles.append(blank)
+
+    # Pad existing to MAX_TILES
+    while len(existing) < MAX_TILES:
+        existing.append(blank)
+
+    insert_at = find_first_free(existing)
+    n_new = len(new_tiles)
+
+    if insert_at + n_new > MAX_TILES:
+        avail = MAX_TILES - insert_at
+        print(f"warning: only {avail} free slots, truncating {n_new} new tiles",
+              file=sys.stderr)
+        new_tiles = new_tiles[:avail]
+        n_new = len(new_tiles)
+
+    for i, tile in enumerate(new_tiles):
+        existing[insert_at + i] = tile
 
     with open(output_path, "wb") as f:
-        for tile in tiles:
+        for tile in existing:
             f.write(tile)
 
     print(
-        f"{len(sprites)} sprite(s) → {n_tiles} tile(s) → {output_path}",
+        f"{len(sprites)} sprite(s) → {n_new} tile(s) @ slot {insert_at} → {output_path}",
         file=sys.stderr,
     )
 

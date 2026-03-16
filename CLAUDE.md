@@ -25,10 +25,11 @@ Single-process SDL2 app. All mutable state lives in one `EditorState` struct (`m
 
 **Key files:**
 - `chr.h/c` — `ChrPage` pixel data, `PaletteState`, `chr_load`, `chr_init`
-- `main.h` — all enums (`ViewMode`, `WrapMode`, `SpriteMode`, `InputType`) and `EditorState`
+- `main.h` — all enums (`ViewMode`, `WrapMode`, `SpriteMode`, `InputType`, `ComposeLayer`) and `EditorState`
 - `panel.h` — layout constants shared by both `render.c` and `input.c` (macros only, no C code)
 - `export.h/c` — `export_chr(chr, ntiles, path)` writes raw NES CHR binary
 - `font.h/c` — embedded 5×7 bitmap font for overlays
+- `compose.h/c` — `ComposeScene`, `ComposeData`, `compose_init`, `compose_save`, `compose_load`
 
 ## NES CHR format
 
@@ -45,13 +46,38 @@ All dimensions are runtime — no compile-time canvas constants. Call `state_upd
 - `win_w = canvas_w + PANEL_W` (128 px panel, always right of canvas)
 - `win_h = max(canvas_h, PANEL_FULL_H) + STATUS_H`
 
+In compose mode, `state_update_dims` uses a different path:
+- `compose_canvas_w = 256 × compose_zoom`, `compose_canvas_h = 240 × compose_zoom`
+- Two-column panel: CHR picker (left) at `COMPOSE_PICKER_SCALE` + controls (right)
+- `win_w = compose_canvas_w + panel_w`
+
 ## Sprite-16 mode
 
 When `sprite_mode == SPRITE_16`, 4 sequential tiles are displayed as one 16×16 sprite: layout is `[0][2] / [1][3]` (column-major). `screen_to_tile` and `sel_tile_idx` both account for this remapping. Operations that affect a selected sprite (palette assign, `[`/`]` cycling, right-click) always apply to all 4 sub-tiles.
 
+## Compose mode
+
+Press `Tab` to enter compose mode — a NES screen layout editor (256×240 nametable). Tiles from the CHR sheet are arranged into backgrounds and sprites respecting NES hardware constraints.
+
+**Layout:** Compose canvas on left (256×240 scaled by `compose_zoom` 1–4×), two-column panel on right (CHR picker at 2× left, controls right).
+
+**Layers:**
+- **BG layer** (`B` key): LMB places `brush_tile` on the 32×30 nametable; auto-sets 2×2 attribute palette. RMB eyedroppers tile+palette. Shift+LMB erases.
+- **Sprite layer** (`L` key): LMB places/selects/drags sprites (max 64). RMB deletes. Arrow keys nudge ±1px. H/F flip brush. Sprites support hflip/vflip and behind-BG flag.
+
+**NES accuracy:** BG tiles cannot flip (only sprites). Attribute table is per 2×2 tile block (palettes 0–3 for BG, 4–7 for sprites).
+
+**Scenes:** Up to 16 scenes per file. PgUp/PgDn to navigate, Ctrl+N to add. Ctrl+S saves `.scn` sidecar. Auto-loads alongside CHR file.
+
+**File format (`.scn`):** Binary — magic `"NSCN"`, version byte, scene count, then per scene: 960B nametable + 240B attributes + sprite list.
+
+## Clipboard (cross-instance)
+
+Ctrl+C / Ctrl+X / Ctrl+V in tile mode uses a file-based clipboard at `/tmp/chrmaker_clipboard.bin`. This allows copy/paste between separate chrmaker instances. Format: 1 byte s16 flag + 1 or 4 tiles of raw pixel data.
+
 ## Sprite generation (Claude scripting)
 
-`chrgen.py` converts inline JSON sprite definitions to raw NES CHR binary. No intermediate files — Claude pipes pixel data directly via heredoc:
+`chrgen.py` converts inline JSON sprite definitions to raw NES CHR binary. **Injects** into existing files — finds the first blank tile slot and appends there, preserving all existing content. Claude pipes pixel data directly via heredoc:
 
 ```bash
 python3 /home/jimmy/projects/nes/chrmaker/chrgen.py output.chr << 'EOF'
@@ -65,6 +91,7 @@ EOF
 - `size: 8` → 1 tile; `size: 16` → 4 tiles in S16 column-major order (TL/BL/TR/BR)
 - Pixel values `0`–`3` are NES bitplane indices (never RGB)
 - Output is always padded to 256 tiles (4096 bytes)
+- Existing tiles are preserved; new sprites are injected at the first blank slot
 - Status goes to stderr only; file is immediately openable with `./chrmaker output.chr`
 
 **Color convention used by Claude when drawing:**
@@ -73,7 +100,7 @@ EOF
 - `2` = mid-tone fill (suit, skin, main body colour)
 - `3` = bright highlight / accent (visor, glow, detail)
 
-## Keyboard shortcuts (reference)
+## Keyboard shortcuts (CHR editor)
 
 | Key | Action |
 |-----|--------|
@@ -85,10 +112,32 @@ EOF
 | `V` | Toggle grayscale ↔ NES colour view |
 | `=` / `-` | Zoom in / out (1–4×) |
 | `[` / `]` | Cycle tile's sub-palette |
+| `Ctrl+C` / `Ctrl+V` / `Ctrl+X` | Copy / paste / cut tile (cross-instance) |
 | `Ctrl+S` | Save CHR; `Ctrl+Shift+S` = save as |
 | `Ctrl+O` | Open CHR file (text overlay) |
 | `Ctrl+R` | Resize canvas (text overlay, format `COLSxROWS`) |
 | `Ctrl+Shift+P` | Save palette to `stem.pal` (derived from current CHR path) |
 | `Ctrl+P` | Load palette from file (text overlay) |
+| `Tab` | Enter compose mode |
 | `?` / `F1` | Toggle help overlay |
 | `Escape` | Close overlay → exit tile mode → quit |
+
+## Keyboard shortcuts (compose mode)
+
+| Key | Action |
+|-----|--------|
+| `B` / `L` | Switch to BG / sprite layer |
+| `LMB` | Place tile (BG) or place/select sprite (SPR) |
+| `RMB` | Eyedropper (BG) or delete sprite (SPR) |
+| `Shift+LMB` | Erase tile (BG) |
+| `H` / `F` | Toggle brush hflip / vflip (sprite layer) |
+| `[` / `]` | Cycle brush palette (BG: 0–3, SPR: 4–7) |
+| `G` | Toggle attribute grid |
+| `=` / `-` | Zoom in / out (1–4×) |
+| `Arrow keys` | Nudge selected sprite ±1px |
+| `Delete` | Delete selected sprite |
+| `PgUp` / `PgDn` | Switch scenes |
+| `Ctrl+N` | Add new scene |
+| `Ctrl+S` | Save scene file (`.scn`) |
+| `?` / `F1` | Toggle compose help overlay |
+| `Tab` / `Escape` | Exit compose mode |

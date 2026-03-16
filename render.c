@@ -1,6 +1,7 @@
 #include "render.h"
 #include "panel.h"
 #include "font.h"
+#include "compose.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -55,7 +56,8 @@ static const SDL_Color GRAY_RAMP[4] = {
 
 /* ── Canvas texture ───────────────────────────────────────────── */
 /* NES-resolution streaming texture; SDL scales it to canvas_w×CANVAS_H. */
-static SDL_Texture *canvas_tex = NULL;
+static SDL_Texture *canvas_tex  = NULL;
+static SDL_Texture *compose_tex = NULL;   /* 256x240 for compose mode */
 
 static void create_canvas_tex(SDL_Renderer *ren, const EditorState *s) {
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");
@@ -70,17 +72,30 @@ static void create_canvas_tex(SDL_Renderer *ren, const EditorState *s) {
         fprintf(stderr, "SDL_CreateTexture: %s\n", SDL_GetError());
 }
 
+static void create_compose_tex(SDL_Renderer *ren) {
+    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");
+    compose_tex = SDL_CreateTexture(
+        ren, SDL_PIXELFORMAT_ARGB8888,
+        SDL_TEXTUREACCESS_STREAMING, 256, 240);
+    if (!compose_tex)
+        fprintf(stderr, "compose_tex: %s\n", SDL_GetError());
+}
+
 void render_init(SDL_Renderer *ren, const EditorState *s) {
     create_canvas_tex(ren, s);
+    create_compose_tex(ren);
 }
 
 void render_resize(SDL_Renderer *ren, const EditorState *s) {
     if (canvas_tex) { SDL_DestroyTexture(canvas_tex); canvas_tex = NULL; }
     create_canvas_tex(ren, s);
+    if (compose_tex) { SDL_DestroyTexture(compose_tex); compose_tex = NULL; }
+    create_compose_tex(ren);
 }
 
 void render_destroy(void) {
-    if (canvas_tex) { SDL_DestroyTexture(canvas_tex); canvas_tex = NULL; }
+    if (canvas_tex)  { SDL_DestroyTexture(canvas_tex);  canvas_tex  = NULL; }
+    if (compose_tex) { SDL_DestroyTexture(compose_tex); compose_tex = NULL; }
 }
 
 /* ── Colour lookup ────────────────────────────────────────────── */
@@ -786,6 +801,9 @@ static void render_help_overlay(SDL_Renderer *ren, const EditorState *s) {
     font_draw_str(ren, " DROP FILE   OPEN",               x, y, WHT); y += lh;
     font_draw_str(ren, " =/-         ZOOM IN/OUT",        x, y, WHT); y += lh + hg;
 
+    font_draw_str(ren, "COMPOSE MODE",                     x, y, CYN); y += lh;
+    font_draw_str(ren, " TAB         COMPOSE MODE",       x, y, WHT); y += lh + hg;
+
     font_draw_str(ren, " F1 OR ?   TOGGLE HELP",          x, y, DIM); y += lh;
     font_draw_str(ren, " ESC       QUIT",                 x, y, DIM);
     (void)y;
@@ -841,10 +859,441 @@ static void render_input_overlay(SDL_Renderer *ren, const EditorState *s) {
     font_draw_str(ren, "ENTER=OK  ESC=CANCEL", tx, ty + 2, DIM);
 }
 
+/* ── Compose canvas rendering ─────────────────────────────────── */
+
+static SDL_Color compose_get_bg_color(const EditorState *s, int pal_idx, int val) {
+    uint8_t master = s->pal.sub[pal_idx & 3].idx[val & 3] & 0x3F;
+    return NES_MASTER_PALETTE[master];
+}
+
+static SDL_Color compose_get_spr_color(const EditorState *s, int pal_idx, int val) {
+    uint8_t master = s->pal.sub[pal_idx & 7].idx[val & 3] & 0x3F;
+    return NES_MASTER_PALETTE[master];
+}
+
+static void render_compose_canvas(const EditorState *s) {
+    if (!compose_tex) return;
+
+    void *pixels; int pitch;
+    if (SDL_LockTexture(compose_tex, NULL, &pixels, &pitch) != 0) return;
+
+    uint32_t *dst    = (uint32_t *)pixels;
+    int       stride = pitch / 4;
+
+    const ComposeScene *sc = &s->compose.scenes[s->compose.active_scene];
+
+    /* Universal background color: palette 0, color 0 */
+    SDL_Color bg = compose_get_bg_color(s, 0, 0);
+    uint32_t bg_px = (0xFFu << 24) | ((uint32_t)bg.r << 16) |
+                     ((uint32_t)bg.g << 8) | bg.b;
+    for (int y = 0; y < 240; y++)
+        for (int x = 0; x < 256; x++)
+            dst[y * stride + x] = bg_px;
+
+    /* Draw nametable (BG tiles) */
+    for (int ty = 0; ty < COMPOSE_NT_H; ty++) {
+        for (int tx = 0; tx < COMPOSE_NT_W; tx++) {
+            uint8_t tile_idx = sc->nametable[ty][tx];
+            int pal_idx = sc->attr[ty / 2][tx / 2] & 3;
+
+            for (int row = 0; row < TILE_H; row++) {
+                for (int col = 0; col < TILE_W; col++) {
+                    int px_x = tx * TILE_W + col;
+                    int px_y = ty * TILE_H + row;
+                    if (px_x >= 256 || px_y >= 240) continue;
+                    uint8_t val = s->chr.px[tile_idx][row][col] & 3;
+                    if (tile_idx == 0 && val == 0) continue; /* transparent BG */
+                    SDL_Color c = compose_get_bg_color(s, pal_idx, val);
+                    dst[px_y * stride + px_x] =
+                        (0xFFu << 24) | ((uint32_t)c.r << 16) |
+                        ((uint32_t)c.g << 8) | c.b;
+                }
+            }
+        }
+    }
+
+    /* Draw sprites (front to back — later sprites draw on top) */
+    for (int i = 0; i < sc->sprite_count; i++) {
+        const ComposeSprite *sp = &sc->sprites[i];
+        bool s16 = (s->sprite_mode == SPRITE_16);
+        int spr_w = s16 ? 16 : 8;
+        int spr_h = s16 ? 16 : 8;
+
+        for (int row = 0; row < spr_h; row++) {
+            for (int col = 0; col < spr_w; col++) {
+                int src_col = sp->hflip ? (spr_w - 1 - col) : col;
+                int src_row = sp->vflip ? (spr_h - 1 - row) : row;
+
+                int tile;
+                int lr, lc;
+                if (s16) {
+                    /* Column-major layout: [0][2] / [1][3] */
+                    int sub_x = src_col / TILE_W;
+                    int sub_y = src_row / TILE_H;
+                    int p = sub_x * 2 + sub_y;
+                    tile = sp->tile + p;
+                    lr = src_row % TILE_H;
+                    lc = src_col % TILE_W;
+                } else {
+                    tile = sp->tile;
+                    lr = src_row;
+                    lc = src_col;
+                }
+
+                if (tile >= CHR_MAX_TILES) continue;
+                uint8_t val = s->chr.px[tile][lr][lc] & 3;
+                if (val == 0) continue; /* transparent */
+
+                int px_x = sp->x + col;
+                int px_y = sp->y + row;
+                if (px_x >= 256 || px_y >= 240) continue;
+
+                SDL_Color c = compose_get_spr_color(s, sp->palette, val);
+                dst[px_y * stride + px_x] =
+                    (0xFFu << 24) | ((uint32_t)c.r << 16) |
+                    ((uint32_t)c.g << 8) | c.b;
+            }
+        }
+    }
+
+    SDL_UnlockTexture(compose_tex);
+}
+
+/* ── Compose: attribute grid overlay ─────────────────────────── */
+static void render_compose_attr_grid(SDL_Renderer *ren, const EditorState *s) {
+    if (!s->compose_show_attr_grid) return;
+
+    int z = s->compose_zoom;
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(ren, 100, 60, 60, 80);
+
+    /* Vertical lines every 16px (2 tiles) */
+    for (int i = 1; i < 16; i++) {
+        int x = i * 16 * z;
+        SDL_RenderDrawLine(ren, x, 0, x, s->compose_canvas_h - 1);
+    }
+    /* Horizontal lines every 16px */
+    for (int i = 1; i < 15; i++) {
+        int y = i * 16 * z;
+        SDL_RenderDrawLine(ren, 0, y, s->compose_canvas_w - 1, y);
+    }
+
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+}
+
+/* ── Compose: hover ghost + highlights ───────────────────────── */
+static void render_compose_hover(SDL_Renderer *ren, const EditorState *s) {
+    int hx = s->compose_hover_x;
+    int hy = s->compose_hover_y;
+    if (hx < 0 || hy < 0) return;
+
+    int z = s->compose_zoom;
+
+    if (s->compose_layer == COMPOSE_BG) {
+        /* Translucent ghost of brush tile */
+        SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+        for (int row = 0; row < TILE_H; row++) {
+            for (int col = 0; col < TILE_W; col++) {
+                uint8_t val = s->chr.px[s->brush_tile & 0xFF][row][col] & 3;
+                SDL_Color c = compose_get_bg_color(s, s->active_sub_pal, val);
+                SDL_SetRenderDrawColor(ren, c.r, c.g, c.b, 120);
+                SDL_Rect r = { hx * TILE_W * z + col * z,
+                               hy * TILE_H * z + row * z, z, z };
+                SDL_RenderFillRect(ren, &r);
+            }
+        }
+        SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+
+        /* Border */
+        SDL_SetRenderDrawColor(ren, 200, 200, 60, 255);
+        SDL_Rect border = { hx * TILE_W * z, hy * TILE_H * z, TILE_W * z, TILE_H * z };
+        SDL_RenderDrawRect(ren, &border);
+    }
+}
+
+/* ── Compose: selected sprite highlight ──────────────────────── */
+static void render_compose_spr_highlight(SDL_Renderer *ren, const EditorState *s) {
+    if (s->compose_spr_sel < 0) return;
+    const ComposeScene *sc = &s->compose.scenes[s->compose.active_scene];
+    if (s->compose_spr_sel >= sc->sprite_count) return;
+
+    const ComposeSprite *sp = &sc->sprites[s->compose_spr_sel];
+    int z = s->compose_zoom;
+    int spr_w = (s->sprite_mode == SPRITE_16) ? 16 : 8;
+    int spr_h = (s->sprite_mode == SPRITE_16) ? 16 : 8;
+
+    SDL_SetRenderDrawColor(ren, 0, 220, 255, 255);
+    SDL_Rect border = { sp->x * z, sp->y * z, spr_w * z, spr_h * z };
+    SDL_RenderDrawRect(ren, &border);
+}
+
+/* ── Compose panel ───────────────────────────────────────────── */
+static void render_compose_panel(SDL_Renderer *ren, const EditorState *s) {
+    const int BX = s->compose_canvas_w;
+    int pw = s->panel_w;
+
+    /* Background */
+    fill(ren, BX, 0, pw, s->win_h - STATUS_H, 18, 18, 30);
+
+    static const SDL_Color WHT = {200, 200, 200, 255};
+    static const SDL_Color DIM = {100, 100, 130, 255};
+    static const SDL_Color YLW = {220, 195,  50, 255};
+
+    int pscale    = COMPOSE_PICKER_SCALE;
+    int picker_x0 = BX + PANEL_PAL_X0;
+    int picker_y0 = 8;
+    int picker_w  = s->chr_cols * TILE_W * pscale;
+    int picker_h  = s->chr_rows * TILE_H * pscale;
+    int ntiles    = s->chr_cols * s->chr_rows;
+
+    /* Right column x: after picker + gap */
+    int ctrl_x = picker_x0 + picker_w + 8;
+
+    /* ── Left column: CHR picker (COMPOSE_PICKER_SCALE×) ── */
+    fill(ren, picker_x0 - 1, picker_y0 - 1, picker_w + 2, picker_h + 2, 8, 8, 8);
+
+    for (int t = 0; t < ntiles && t < CHR_MAX_TILES; t++) {
+        int tx_off = (t % s->chr_cols) * TILE_W * pscale;
+        int ty_off = (t / s->chr_cols) * TILE_H * pscale;
+
+        for (int row = 0; row < TILE_H; row++) {
+            for (int col = 0; col < TILE_W; col++) {
+                uint8_t val = s->chr.px[t][row][col] & 3;
+                SDL_Color c = get_display_color(s, t, val);
+                fill(ren, picker_x0 + tx_off + col * pscale,
+                          picker_y0 + ty_off + row * pscale,
+                          pscale, pscale, c.r, c.g, c.b);
+            }
+        }
+    }
+
+    /* Highlight selected brush tile */
+    {
+        int bt = s->brush_tile;
+        if (bt >= 0 && bt < ntiles) {
+            int bx = (bt % s->chr_cols) * TILE_W * pscale;
+            int by = (bt / s->chr_cols) * TILE_H * pscale;
+            SDL_SetRenderDrawColor(ren, 255, 210, 40, 255);
+            SDL_Rect hl = { picker_x0 + bx, picker_y0 + by,
+                            TILE_W * pscale, TILE_H * pscale };
+            SDL_RenderDrawRect(ren, &hl);
+        }
+    }
+
+    /* ── Right column: controls ── */
+    int y = picker_y0;
+
+    /* Brush preview (4x) */
+    font_draw_str(ren, "BRUSH", ctrl_x, y, DIM);
+    y += font_line_h();
+    {
+        int prev_sz = 32; /* 8 * 4x */
+        fill(ren, ctrl_x - 1, y - 1, prev_sz + 2, prev_sz + 2, 8, 8, 8);
+
+        int bt = s->brush_tile & 0xFF;
+        for (int row = 0; row < TILE_H; row++) {
+            for (int col = 0; col < TILE_W; col++) {
+                int src_r = s->brush_vflip ? (TILE_H - 1 - row) : row;
+                int src_c = s->brush_hflip ? (TILE_W - 1 - col) : col;
+                uint8_t val = s->chr.px[bt][src_r][src_c] & 3;
+                SDL_Color c = get_display_color(s, bt, val);
+                fill(ren, ctrl_x + col * 4, y + row * 4, 4, 4, c.r, c.g, c.b);
+            }
+        }
+
+        /* Flip indicators next to preview */
+        int info_x = ctrl_x + prev_sz + 8;
+        if (s->compose_layer == COMPOSE_SPR) {
+            SDL_Color fc = s->brush_hflip ? YLW : DIM;
+            font_draw_str(ren, "H", info_x, y, fc);
+            fc = s->brush_vflip ? YLW : DIM;
+            font_draw_str(ren, "V", info_x, y + font_line_h(), fc);
+        }
+    }
+    y += 32 + 8;
+
+    /* Palette rows */
+    font_draw_str(ren, "PAL", ctrl_x, y, DIM);
+    y += font_line_h();
+
+    for (int i = 0; i < 8; i++) {
+        int ry = y + i * 14;
+
+        if (i == s->active_sub_pal)
+            fill(ren, ctrl_x - 1, ry - 1,
+                 4 * (10 + 2) + 1, 10 + 2, 50, 50, 80);
+
+        /* BG/SPR indicator */
+        if (i < 4)
+            fill(ren, ctrl_x - 3, ry, 2, 10, 50, 80, 160);
+        else
+            fill(ren, ctrl_x - 3, ry, 2, 10, 160, 60, 60);
+
+        for (int j = 0; j < 4; j++) {
+            int sx = ctrl_x + j * 12;
+            SDL_Color c = NES_MASTER_PALETTE[s->pal.sub[i].idx[j] & 0x3F];
+            fill(ren, sx, ry, 10, 10, c.r, c.g, c.b);
+        }
+    }
+    y += 8 * 14 + 8;
+
+    /* Layer toggle */
+    {
+        bool is_bg = (s->compose_layer == COMPOSE_BG);
+        SDL_Color bgc = is_bg ? YLW : DIM;
+        SDL_Color spc = is_bg ? DIM : YLW;
+        font_draw_str(ren, "BG", ctrl_x, y, bgc);
+        font_draw_str(ren, "/", ctrl_x + 2 * font_char_w(), y, DIM);
+        font_draw_str(ren, "SPR", ctrl_x + 3 * font_char_w(), y, spc);
+    }
+    y += font_line_h() + 4;
+
+    /* Scene navigator */
+    {
+        char sbuf[24];
+        snprintf(sbuf, sizeof(sbuf), "SCN %d/%d",
+                 s->compose.active_scene + 1, s->compose.scene_count);
+        font_draw_str(ren, sbuf, ctrl_x, y, WHT);
+        font_draw_str(ren, "PGUP/DN", ctrl_x, y + font_line_h(), DIM);
+    }
+    y += font_line_h() * 2 + 4;
+
+    /* Sprite counter */
+    {
+        const ComposeScene *sc = &s->compose.scenes[s->compose.active_scene];
+        char sbuf[24];
+        snprintf(sbuf, sizeof(sbuf), "SPR %d/%d", sc->sprite_count, COMPOSE_MAX_SPR);
+        SDL_Color sc_col = (sc->sprite_count >= COMPOSE_MAX_SPR)
+                               ? (SDL_Color){220, 60, 60, 255} : WHT;
+        font_draw_str(ren, sbuf, ctrl_x, y, sc_col);
+    }
+    y += font_line_h() + 8;
+
+    /* Hints */
+    font_draw_str(ren, "TAB:EXIT", ctrl_x, y, DIM);
+    y += font_line_h();
+    font_draw_str(ren, "?:HELP", ctrl_x, y, DIM);
+    y += font_line_h();
+    font_draw_str(ren, "CTRL+S:SAVE", ctrl_x, y, DIM);
+
+    /* Panel separator line */
+    vline(ren, BX, 0, s->win_h - STATUS_H, 55, 55, 80);
+}
+
+/* ── Compose status bar ──────────────────────────────────────── */
+static void render_compose_status(SDL_Renderer *ren, const EditorState *s) {
+    const int STATUS_Y = s->win_h - STATUS_H;
+    fill(ren, 0, STATUS_Y, s->win_w, STATUS_H, 12, 12, 12);
+    hline(ren, 0, STATUS_Y, s->win_w, 55, 55, 80);
+
+    int ty = STATUS_Y + (STATUS_H - font_line_h()) / 2 + 1;
+    int cw = font_char_w();
+
+    /* COMPOSE indicator */
+    static const SDL_Color CMPC = {180, 120, 220, 255};
+    font_draw_str(ren, "COMPOSE", 4, ty, CMPC);
+
+    /* Layer indicator */
+    int lx = 4 + 8 * cw;
+    if (s->compose_layer == COMPOSE_BG) {
+        static const SDL_Color BGC = {80, 140, 220, 255};
+        font_draw_str(ren, "BG", lx, ty, BGC);
+    } else {
+        static const SDL_Color SPC = {220, 100, 80, 255};
+        font_draw_str(ren, "SPR", lx, ty, SPC);
+    }
+
+    /* Hover tile coords */
+    if (s->compose_hover_x >= 0 && s->compose_hover_y >= 0) {
+        char cbuf[24];
+        snprintf(cbuf, sizeof(cbuf), "%d,%d", s->compose_hover_x, s->compose_hover_y);
+        static const SDL_Color POS = {140, 160, 200, 255};
+        font_draw_str(ren, cbuf, lx + 5 * cw, ty, POS);
+    }
+
+    /* Zoom — right-aligned */
+    char zbuf[4];
+    snprintf(zbuf, sizeof(zbuf), "%dX", s->compose_zoom);
+    int zx = s->win_w - (int)strlen(zbuf) * cw - 4;
+    static const SDL_Color ZCOL = {140, 160, 200, 255};
+    font_draw_str(ren, zbuf, zx, ty, ZCOL);
+}
+
+/* ── Compose help overlay ─────────────────────────────────────── */
+static void render_compose_help(SDL_Renderer *ren, const EditorState *s) {
+    if (!s->compose_show_help) return;
+
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(ren, 0, 0, 18, 228);
+    SDL_Rect bg = {0, 0, s->win_w, s->win_h - STATUS_H};
+    SDL_RenderFillRect(ren, &bg);
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+
+    SDL_SetRenderDrawColor(ren, 120, 60, 180, 255);
+    SDL_RenderDrawRect(ren, &bg);
+
+    static const SDL_Color WHT = {210, 210, 210, 255};
+    static const SDL_Color DIM = {120, 120, 150, 255};
+    static const SDL_Color YLW = {220, 195,  50, 255};
+    static const SDL_Color CYN = {100, 190, 210, 255};
+
+    int x  = 20;
+    int y  = 14;
+    int lh = font_line_h();
+    int hg = lh / 2;
+
+    font_draw_str(ren, "COMPOSE MODE", x, y, YLW); y += lh + hg;
+
+    font_draw_str(ren, "LAYERS",                          x, y, CYN); y += lh;
+    font_draw_str(ren, " B       BG LAYER",               x, y, WHT); y += lh;
+    font_draw_str(ren, " L       SPRITE LAYER",           x, y, WHT); y += lh + hg;
+
+    font_draw_str(ren, "BG LAYER",                        x, y, CYN); y += lh;
+    font_draw_str(ren, " LMB     PLACE TILE",             x, y, WHT); y += lh;
+    font_draw_str(ren, " RMB     EYEDROPPER",             x, y, WHT); y += lh;
+    font_draw_str(ren, " SHFT+LMB  ERASE TILE",          x, y, WHT); y += lh;
+    font_draw_str(ren, " [/]     CYCLE PALETTE (0-3)",    x, y, WHT); y += lh + hg;
+
+    font_draw_str(ren, "SPRITE LAYER",                    x, y, CYN); y += lh;
+    font_draw_str(ren, " LMB     PLACE / SELECT SPRITE",  x, y, WHT); y += lh;
+    font_draw_str(ren, " DRAG    MOVE SPRITE",            x, y, WHT); y += lh;
+    font_draw_str(ren, " RMB     DELETE SPRITE",          x, y, WHT); y += lh;
+    font_draw_str(ren, " ARROWS  NUDGE SPRITE 1PX",      x, y, WHT); y += lh;
+    font_draw_str(ren, " DEL     DELETE SELECTED",        x, y, WHT); y += lh;
+    font_draw_str(ren, " H/F     FLIP H/V (BRUSH)",      x, y, WHT); y += lh;
+    font_draw_str(ren, " [/]     CYCLE PALETTE (4-7)",    x, y, WHT); y += lh + hg;
+
+    font_draw_str(ren, "VIEW & SCENES",                   x, y, CYN); y += lh;
+    font_draw_str(ren, " G       TOGGLE ATTR GRID",       x, y, WHT); y += lh;
+    font_draw_str(ren, " =/-     ZOOM IN/OUT",            x, y, WHT); y += lh;
+    font_draw_str(ren, " PGUP/DN SWITCH SCENE",           x, y, WHT); y += lh;
+    font_draw_str(ren, " CTRL+N  ADD NEW SCENE",          x, y, WHT); y += lh;
+    font_draw_str(ren, " CTRL+S  SAVE SCENE FILE",        x, y, WHT); y += lh + hg;
+
+    font_draw_str(ren, " TAB/ESC EXIT COMPOSE",           x, y, DIM); y += lh;
+    font_draw_str(ren, " F1 OR ? TOGGLE HELP",            x, y, DIM);
+    (void)y;
+}
+
 /* ── Main render entry ────────────────────────────────────────── */
 void render_frame(SDL_Renderer *ren, const EditorState *s) {
     set_color(ren, 10, 10, 10);
     SDL_RenderClear(ren);
+
+    if (s->compose_mode) {
+        render_compose_canvas(s);
+        SDL_Rect dst = {0, 0, s->compose_canvas_w, s->compose_canvas_h};
+        SDL_RenderCopy(ren, compose_tex, NULL, &dst);
+
+        render_compose_attr_grid(ren, s);
+        render_compose_hover(ren, s);
+        render_compose_spr_highlight(ren, s);
+        render_compose_panel(ren, s);
+        render_compose_status(ren, s);
+        render_compose_help(ren, s);
+        SDL_RenderPresent(ren);
+        return;
+    }
 
     render_canvas(s);
     SDL_Rect canvas_dst = {0, 0, s->canvas_w, s->canvas_h};

@@ -1,11 +1,43 @@
 #include "input.h"
 #include "panel.h"
+#include "compose.h"
 #include <string.h>
 #include <stdio.h>
 
 /* ── Helpers ──────────────────────────────────────────────────── */
 
 static int wmod(int v, int n) { return ((v % n) + n) % n; }
+
+/* ── File-based clipboard (cross-instance copy/paste) ────────── */
+
+#define CLIPBOARD_PATH "/tmp/chrmaker_clipboard.bin"
+
+static void clipboard_save(const EditorState *s) {
+    FILE *f = fopen(CLIPBOARD_PATH, "wb");
+    if (!f) return;
+    uint8_t flag = s->clipboard_s16 ? 1 : 0;
+    fwrite(&flag, 1, 1, f);
+    int cnt = s->clipboard_s16 ? 4 : 1;
+    for (int p = 0; p < cnt; p++)
+        fwrite(s->clipboard[p], 1, TILE_H * TILE_W, f);
+    fclose(f);
+}
+
+static void clipboard_load(EditorState *s) {
+    FILE *f = fopen(CLIPBOARD_PATH, "rb");
+    if (!f) return;
+    uint8_t flag;
+    if (fread(&flag, 1, 1, f) != 1) { fclose(f); return; }
+    s->clipboard_s16 = (flag != 0);
+    int cnt = s->clipboard_s16 ? 4 : 1;
+    for (int p = 0; p < cnt; p++) {
+        if (fread(s->clipboard[p], 1, TILE_H * TILE_W, f) != TILE_H * TILE_W) {
+            fclose(f); return;
+        }
+    }
+    s->has_clipboard = true;
+    fclose(f);
+}
 
 static void anim_finish_pick(EditorState *s) {
     int stride = (s->sprite_mode == SPRITE_16 && s->chr_cols >= 2) ? 4 : 1;
@@ -290,6 +322,340 @@ static void panel_click(EditorState *s, int px, int py) {
     }
 }
 
+/* ── Compose mode: get active scene ───────────────────────────── */
+static ComposeScene *active_scene(EditorState *s) {
+    return &s->compose.scenes[s->compose.active_scene];
+}
+
+/* ── Compose mode: panel click ───────────────────────────────── */
+static void compose_panel_click(EditorState *s, int px, int py) {
+    /* Two-column layout: picker on left, controls on right.
+       All coords are panel-relative (px=0 at panel left edge). */
+    int pscale    = COMPOSE_PICKER_SCALE;
+    int picker_y0 = 8;
+    int picker_x0 = PANEL_PAL_X0;
+    int picker_w  = s->chr_cols * TILE_W * pscale;
+    int picker_h  = s->chr_rows * TILE_H * pscale;
+
+    /* Right column starts after picker + gap */
+    int ctrl_x = picker_x0 + picker_w + 8;
+
+    /* ── Left column: CHR picker ── */
+    if (py >= picker_y0 && py < picker_y0 + picker_h &&
+        px >= picker_x0 && px < picker_x0 + picker_w) {
+        int tx = (px - picker_x0) / (TILE_W * pscale);
+        int ty = (py - picker_y0) / (TILE_H * pscale);
+        s->brush_tile = ty * s->chr_cols + tx;
+        return;
+    }
+
+    /* ── Right column: controls (must match render layout) ── */
+    /* Only respond if click is in the right column area */
+    if (px < ctrl_x) return;
+
+    /* Control y positions mirror render_compose_panel right column:
+       y starts at picker_y0 (=8), then:
+       brush label (font_line_h=18), preview (32), gap (8),
+       pal label (18), 8 rows × 14, gap (8),
+       layer (font_line_h + 4), ... */
+    int y = picker_y0;
+    y += 18;      /* "BRUSH" label */
+    y += 32 + 8;  /* preview + gap */
+
+    /* Palette rows */
+    int pal_label_y = y;
+    y += 18;  /* "PAL" label */
+    int pal_y0 = y;
+    int pal_row_h = 14;
+    if (py >= pal_y0 && py < pal_y0 + 8 * pal_row_h) {
+        int row = (py - pal_y0) / pal_row_h;
+        if (row >= 0 && row <= 7)
+            s->active_sub_pal = row;
+        return;
+    }
+    (void)pal_label_y;
+    y += 8 * pal_row_h + 8;
+
+    /* Layer toggle */
+    if (py >= y && py < y + 18) {
+        s->compose_layer = (s->compose_layer == COMPOSE_BG) ? COMPOSE_SPR : COMPOSE_BG;
+        return;
+    }
+}
+
+/* ── Compose mode: canvas click ──────────────────────────────── */
+static void compose_canvas_click(EditorState *s, int mx, int my, bool left, bool shift) {
+    int tile_x = mx / (TILE_W * s->compose_zoom);
+    int tile_y = my / (TILE_H * s->compose_zoom);
+    if (tile_x < 0 || tile_x >= COMPOSE_NT_W || tile_y < 0 || tile_y >= COMPOSE_NT_H) return;
+
+    ComposeScene *sc = active_scene(s);
+
+    if (s->compose_layer == COMPOSE_BG) {
+        if (left) {
+            if (shift) {
+                /* Erase: set tile to 0 */
+                sc->nametable[tile_y][tile_x] = 0;
+            } else {
+                /* Place tile */
+                sc->nametable[tile_y][tile_x] = (uint8_t)(s->brush_tile & 0xFF);
+                /* Auto-set attribute for this 2x2 block */
+                int ax = tile_x / 2;
+                int ay = tile_y / 2;
+                if (ay < 15 && ax < 16)
+                    sc->attr[ay][ax] = (uint8_t)(s->active_sub_pal & 3);
+            }
+        } else {
+            /* Right-click: eyedropper — pick tile + palette */
+            s->brush_tile = sc->nametable[tile_y][tile_x];
+            int ax = tile_x / 2;
+            int ay = tile_y / 2;
+            if (ay < 15 && ax < 16)
+                s->active_sub_pal = sc->attr[ay][ax] & 3;
+        }
+    } else {
+        /* Sprite layer */
+        int px_x = mx / s->compose_zoom;
+        int px_y = my / s->compose_zoom;
+
+        if (left) {
+            /* Check if clicking on existing sprite */
+            int spr_w = (s->sprite_mode == SPRITE_16) ? 16 : 8;
+            int spr_h = (s->sprite_mode == SPRITE_16) ? 16 : 8;
+            for (int i = sc->sprite_count - 1; i >= 0; i--) {
+                ComposeSprite *sp = &sc->sprites[i];
+                if (px_x >= sp->x && px_x < sp->x + spr_w &&
+                    px_y >= sp->y && px_y < sp->y + spr_h) {
+                    s->compose_spr_sel  = i;
+                    s->compose_spr_drag = i;
+                    s->drag_off_x = px_x - sp->x;
+                    s->drag_off_y = px_y - sp->y;
+                    return;
+                }
+            }
+            /* Place new sprite */
+            if (sc->sprite_count < COMPOSE_MAX_SPR) {
+                int idx = sc->sprite_count++;
+                ComposeSprite *sp = &sc->sprites[idx];
+                sp->x       = (uint8_t)(px_x < 255 ? px_x : 255);
+                sp->y       = (uint8_t)(px_y < 239 ? px_y : 239);
+                sp->tile    = (uint16_t)s->brush_tile;
+                sp->palette = (uint8_t)(s->active_sub_pal & 7);
+                sp->hflip   = s->brush_hflip;
+                sp->vflip   = s->brush_vflip;
+                sp->behind_bg = false;
+                s->compose_spr_sel = idx;
+            }
+        } else {
+            /* Right-click: delete sprite under cursor */
+            int spr_w = (s->sprite_mode == SPRITE_16) ? 16 : 8;
+            int spr_h = (s->sprite_mode == SPRITE_16) ? 16 : 8;
+            for (int i = sc->sprite_count - 1; i >= 0; i--) {
+                ComposeSprite *sp = &sc->sprites[i];
+                if (px_x >= sp->x && px_x < sp->x + spr_w &&
+                    px_y >= sp->y && px_y < sp->y + spr_h) {
+                    /* Remove by shifting */
+                    for (int j = i; j < sc->sprite_count - 1; j++)
+                        sc->sprites[j] = sc->sprites[j + 1];
+                    sc->sprite_count--;
+                    if (s->compose_spr_sel == i) s->compose_spr_sel = -1;
+                    else if (s->compose_spr_sel > i) s->compose_spr_sel--;
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/* ── Compose mode: full input handler ────────────────────────── */
+static void compose_input(const SDL_Event *e, EditorState *s) {
+    int cw = s->compose_canvas_w;
+    int ch = s->compose_canvas_h;
+
+    switch (e->type) {
+        case SDL_QUIT: s->running = false; break;
+
+        case SDL_KEYDOWN:
+            switch (e->key.keysym.sym) {
+                case SDLK_ESCAPE:
+                    if (s->compose_show_help)
+                        s->compose_show_help = false;
+                    else if (s->compose_spr_sel >= 0)
+                        s->compose_spr_sel = -1;
+                    else {
+                        s->compose_mode = false;
+                        s->want_resize  = true;
+                    }
+                    break;
+                case SDLK_TAB:
+                    s->compose_mode = false;
+                    s->want_resize  = true;
+                    break;
+                case SDLK_F1:
+                    s->compose_show_help = !s->compose_show_help;
+                    break;
+                case SDLK_SLASH:
+                    if (e->key.keysym.mod & KMOD_SHIFT)
+                        s->compose_show_help = !s->compose_show_help;
+                    break;
+                case SDLK_b: s->compose_layer = COMPOSE_BG;  break;
+                case SDLK_l: s->compose_layer = COMPOSE_SPR; break;
+                case SDLK_h:
+                    if (s->compose_layer == COMPOSE_SPR)
+                        s->brush_hflip = !s->brush_hflip;
+                    break;
+                case SDLK_f:
+                    if (s->compose_layer == COMPOSE_SPR)
+                        s->brush_vflip = !s->brush_vflip;
+                    break;
+                case SDLK_g:
+                    s->compose_show_attr_grid = !s->compose_show_attr_grid;
+                    break;
+                case SDLK_LEFTBRACKET: {
+                    if (s->compose_layer == COMPOSE_BG)
+                        s->active_sub_pal = (s->active_sub_pal + 3) % 4;
+                    else
+                        s->active_sub_pal = 4 + (s->active_sub_pal + 3) % 4;
+                    break;
+                }
+                case SDLK_RIGHTBRACKET: {
+                    if (s->compose_layer == COMPOSE_BG)
+                        s->active_sub_pal = (s->active_sub_pal + 1) % 4;
+                    else
+                        s->active_sub_pal = 4 + (s->active_sub_pal + 1) % 4;
+                    break;
+                }
+                case SDLK_EQUALS:
+                    if (s->compose_zoom < 4) { s->compose_zoom++; s->want_resize = true; }
+                    break;
+                case SDLK_MINUS:
+                    if (s->compose_zoom > 1) { s->compose_zoom--; s->want_resize = true; }
+                    break;
+                case SDLK_PAGEUP:
+                    if (s->compose.active_scene > 0) s->compose.active_scene--;
+                    break;
+                case SDLK_PAGEDOWN:
+                    if (s->compose.active_scene < s->compose.scene_count - 1)
+                        s->compose.active_scene++;
+                    break;
+                case SDLK_n:
+                    if (e->key.keysym.mod & KMOD_CTRL) {
+                        if (s->compose.scene_count < COMPOSE_MAX_SCENES) {
+                            int idx = s->compose.scene_count++;
+                            memset(&s->compose.scenes[idx], 0, sizeof(ComposeScene));
+                            s->compose.active_scene = idx;
+                        }
+                    }
+                    break;
+                case SDLK_s:
+                    if (e->key.keysym.mod & KMOD_CTRL)
+                        s->want_save_scene = true;
+                    break;
+                case SDLK_DELETE:
+                    if (s->compose_spr_sel >= 0) {
+                        ComposeScene *sc = active_scene(s);
+                        int i = s->compose_spr_sel;
+                        for (int j = i; j < sc->sprite_count - 1; j++)
+                            sc->sprites[j] = sc->sprites[j + 1];
+                        sc->sprite_count--;
+                        s->compose_spr_sel = -1;
+                    }
+                    break;
+                case SDLK_UP:
+                    if (s->compose_spr_sel >= 0) {
+                        ComposeSprite *sp = &active_scene(s)->sprites[s->compose_spr_sel];
+                        if (sp->y > 0) sp->y--;
+                    }
+                    break;
+                case SDLK_DOWN:
+                    if (s->compose_spr_sel >= 0) {
+                        ComposeSprite *sp = &active_scene(s)->sprites[s->compose_spr_sel];
+                        if (sp->y < 239) sp->y++;
+                    }
+                    break;
+                case SDLK_LEFT:
+                    if (s->compose_spr_sel >= 0) {
+                        ComposeSprite *sp = &active_scene(s)->sprites[s->compose_spr_sel];
+                        if (sp->x > 0) sp->x--;
+                    }
+                    break;
+                case SDLK_RIGHT:
+                    if (s->compose_spr_sel >= 0) {
+                        ComposeSprite *sp = &active_scene(s)->sprites[s->compose_spr_sel];
+                        if (sp->x < 255) sp->x++;
+                    }
+                    break;
+                default: break;
+            }
+            break;
+
+        case SDL_MOUSEBUTTONDOWN: {
+            int mx = e->button.x, my = e->button.y;
+            s->mouse_x = mx; s->mouse_y = my;
+            bool left  = (e->button.button == SDL_BUTTON_LEFT);
+            bool right = (e->button.button == SDL_BUTTON_RIGHT);
+            bool shift = (SDL_GetModState() & KMOD_SHIFT) != 0;
+
+            if (left) s->mouse_down = true;
+            if (right) s->right_mouse_down = true;
+
+            if (mx < cw && my < ch) {
+                if (left || right)
+                    compose_canvas_click(s, mx, my, left, shift);
+            } else if (mx >= cw) {
+                if (left)
+                    compose_panel_click(s, mx - cw, my);
+            }
+            break;
+        }
+
+        case SDL_MOUSEBUTTONUP:
+            if (e->button.button == SDL_BUTTON_LEFT) {
+                s->mouse_down = false;
+                s->compose_spr_drag = -1;
+            }
+            if (e->button.button == SDL_BUTTON_RIGHT)
+                s->right_mouse_down = false;
+            break;
+
+        case SDL_MOUSEMOTION: {
+            int mx = e->motion.x, my = e->motion.y;
+            s->mouse_x = mx; s->mouse_y = my;
+
+            /* Update hover position */
+            if (mx < cw && my < ch) {
+                s->compose_hover_x = mx / (TILE_W * s->compose_zoom);
+                s->compose_hover_y = my / (TILE_H * s->compose_zoom);
+            } else {
+                s->compose_hover_x = -1;
+                s->compose_hover_y = -1;
+            }
+
+            /* Sprite dragging */
+            if (s->compose_spr_drag >= 0 && s->mouse_down) {
+                int px_x = mx / s->compose_zoom - s->drag_off_x;
+                int px_y = my / s->compose_zoom - s->drag_off_y;
+                if (px_x < 0)   px_x = 0;
+                if (px_x > 255) px_x = 255;
+                if (px_y < 0)   px_y = 0;
+                if (px_y > 239) px_y = 239;
+                ComposeSprite *sp = &active_scene(s)->sprites[s->compose_spr_drag];
+                sp->x = (uint8_t)px_x;
+                sp->y = (uint8_t)px_y;
+            }
+            /* BG tile painting while dragging */
+            else if (s->mouse_down && s->compose_layer == COMPOSE_BG &&
+                     mx < cw && my < ch) {
+                bool shift = (SDL_GetModState() & KMOD_SHIFT) != 0;
+                compose_canvas_click(s, mx, my, true, shift);
+            }
+            break;
+        }
+
+        default: break;
+    }
+}
+
 /* ── Event dispatch ───────────────────────────────────────────── */
 
 void input_handle(const SDL_Event *e, EditorState *s) {
@@ -319,6 +685,12 @@ void input_handle(const SDL_Event *e, EditorState *s) {
             case SDL_QUIT: s->running = false; break;
             default: break;
         }
+        return;
+    }
+
+    /* Compose mode gets its own full input handler */
+    if (s->compose_mode) {
+        compose_input(e, s);
         return;
     }
 
@@ -361,8 +733,19 @@ void input_handle(const SDL_Event *e, EditorState *s) {
                     }
                     break;
                 case SDLK_v:
-                    s->view_mode = (s->view_mode == VIEW_GRAYSCALE)
-                                 ? VIEW_NES_COLOR : VIEW_GRAYSCALE;
+                    if ((e->key.keysym.mod & KMOD_CTRL) && s->tile_mode) {
+                        clipboard_load(s);  /* refresh from file (cross-instance) */
+                        if (s->has_clipboard) {
+                            int base = sel_tile_idx(s);
+                            bool s16 = (s->sprite_mode == SPRITE_16 && s->chr_cols >= 2);
+                            int cnt  = (s16 && s->clipboard_s16) ? 4 : 1;
+                            for (int p = 0; p < cnt; p++)
+                                memcpy(s->chr.px[base + p], s->clipboard[p], TILE_H * TILE_W);
+                        }
+                    } else if (!(e->key.keysym.mod & KMOD_CTRL)) {
+                        s->view_mode = (s->view_mode == VIEW_GRAYSCALE)
+                                     ? VIEW_NES_COLOR : VIEW_GRAYSCALE;
+                    }
                     break;
 
                 case SDLK_SLASH:
@@ -389,6 +772,34 @@ void input_handle(const SDL_Event *e, EditorState *s) {
                     if (e->key.keysym.mod & KMOD_CTRL)
                         input_begin(s, INPUT_RESIZE);
                     break;
+                case SDLK_c:
+                    if ((e->key.keysym.mod & KMOD_CTRL) && s->tile_mode) {
+                        int base = sel_tile_idx(s);
+                        bool s16 = (s->sprite_mode == SPRITE_16 && s->chr_cols >= 2);
+                        int cnt  = s16 ? 4 : 1;
+                        for (int p = 0; p < cnt; p++)
+                            memcpy(s->clipboard[p], s->chr.px[base + p], TILE_H * TILE_W);
+                        s->clipboard_s16  = s16;
+                        s->has_clipboard  = true;
+                        clipboard_save(s);
+                    }
+                    break;
+                case SDLK_x:
+                    if ((e->key.keysym.mod & KMOD_CTRL) && s->tile_mode) {
+                        int base = sel_tile_idx(s);
+                        bool s16 = (s->sprite_mode == SPRITE_16 && s->chr_cols >= 2);
+                        int cnt  = s16 ? 4 : 1;
+                        for (int p = 0; p < cnt; p++) {
+                            memcpy(s->clipboard[p], s->chr.px[base + p], TILE_H * TILE_W);
+                            memset(s->chr.px[base + p], 0, TILE_H * TILE_W);
+                        }
+                        s->clipboard_s16  = s16;
+                        s->has_clipboard  = true;
+                        clipboard_save(s);
+                    }
+                    break;
+
+
                 case SDLK_e:
                     if (e->key.keysym.mod & KMOD_CTRL)
                         s->want_save = true;
@@ -425,6 +836,13 @@ void input_handle(const SDL_Event *e, EditorState *s) {
                         s->anim_state = ANIM_PICKING_FIRST;
                     else
                         s->anim_state = ANIM_OFF;
+                    break;
+
+                case SDLK_TAB:
+                    s->compose_mode = true;
+                    s->tile_mode    = false;
+                    s->tile_edit    = false;
+                    s->want_resize  = true;
                     break;
 
                 case SDLK_LEFT:

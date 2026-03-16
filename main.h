@@ -1,6 +1,7 @@
 #pragma once
 #include <stdbool.h>
 #include "chr.h"
+#include "compose.h"
 
 typedef enum {
     VIEW_GRAYSCALE,
@@ -27,6 +28,8 @@ typedef enum {
     ANIM_PICKING_LAST,
     ANIM_ACTIVE
 } AnimState;
+
+typedef enum { COMPOSE_BG, COMPOSE_SPR } ComposeLayer;
 
 typedef struct {
     ChrPage      chr;
@@ -97,6 +100,31 @@ typedef struct {
     int          anim_cur;          /* current frame index (0-based)              */
     int          anim_frame_count;  /* total number of frames                     */
     int          anim_preview_zoom; /* preview scale: 1 or 2 (click preview to toggle) */
+
+    /* Clipboard (tile copy/paste in tile mode) */
+    bool         has_clipboard;
+    uint8_t      clipboard[4][TILE_H][TILE_W];  /* up to 4 sub-tiles (sprite-16) */
+    bool         clipboard_s16;                 /* was copy done in sprite-16 mode? */
+
+    /* Compose mode — NES screen layout editor */
+    bool         compose_mode;
+    ComposeData  compose;
+    ComposeLayer compose_layer;
+    int          brush_tile;          /* selected tile from CHR picker       */
+    bool         brush_hflip, brush_vflip;  /* sprite-only flip state        */
+    int          compose_zoom;        /* 1-3, default 2                      */
+    int          compose_canvas_w;    /* 256 * compose_zoom                  */
+    int          compose_canvas_h;    /* 240 * compose_zoom                  */
+    int          compose_hover_x;     /* tile col under cursor (-1 = none)   */
+    int          compose_hover_y;     /* tile row under cursor (-1 = none)   */
+    int          compose_spr_sel;     /* selected sprite index, -1 = none    */
+    int          compose_spr_drag;    /* sprite being dragged, -1 = none     */
+    int          drag_off_x, drag_off_y; /* offset from sprite origin        */
+    bool         compose_show_attr_grid; /* attribute grid (16px blocks)     */
+    bool         compose_show_help;     /* compose help overlay              */
+    bool         want_save_scene;
+    bool         want_load_scene;
+    char         scene_path[256];
 
     /* Loop control */
     bool         running;

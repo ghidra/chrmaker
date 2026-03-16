@@ -7,6 +7,7 @@
 #include "render.h"
 #include "input.h"
 #include "export.h"
+#include "compose.h"
 
 /* ── Palette sidecar path ─────────────────────────────────────── */
 
@@ -25,10 +26,51 @@ static void make_pal_path(char *out, int outlen, const char *chr_path) {
     }
 }
 
+/* Derive the .scn sidecar path from a .chr path. */
+static void make_scn_path(char *out, int outlen, const char *chr_path) {
+    snprintf(out, outlen, "%s", chr_path);
+    char *dot = strrchr(out, '.');
+    char *sl  = strrchr(out, '/');
+    if (dot && (!sl || dot > sl))
+        snprintf(dot, outlen - (int)(dot - out), ".scn");
+    else {
+        int len = (int)strlen(out);
+        snprintf(out + len, outlen - len, ".scn");
+    }
+}
+
 /* ── Dimension helpers ────────────────────────────────────────── */
 
 /* Call whenever chr_cols, chr_rows, or zoom change. */
 static void state_update_dims(EditorState *s) {
+    if (s->compose_mode) {
+        /* Compose mode: fixed 256x240 NES screen, scaled by compose_zoom */
+        s->compose_canvas_w = 256 * s->compose_zoom;
+        s->compose_canvas_h = 240 * s->compose_zoom;
+
+        /* Two-column panel: picker on left, controls on right.
+           controls_w covers palette swatches (4×12=48) + labels. */
+        int pscale     = COMPOSE_PICKER_SCALE;
+        int picker_w   = s->chr_cols * TILE_W * pscale;
+        int controls_w = 120;
+        int gap        = 8;
+        int total_w    = PANEL_PAL_X0 + picker_w + gap + controls_w + PANEL_PAL_X0;
+        s->panel_w     = (total_w > PANEL_W) ? total_w : PANEL_W;
+
+        /* Panel height = max(picker, controls) + top margin + bottom margin */
+        int picker_h   = s->chr_rows * TILE_H * pscale;
+        /* Controls: brush(18+32+8) + pal(18+8*14+8) + layer(22) + scene(40) + spr(22) + hints(58) */
+        int controls_h = 18 + 32 + 8 + 18 + 8*14 + 8 + 22 + 40 + 22 + 58;
+        int col_h      = (picker_h > controls_h) ? picker_h : controls_h;
+        int panel_content_h = 8 + col_h + 8;
+
+        s->win_w = s->compose_canvas_w + s->panel_w;
+        s->win_h = (s->compose_canvas_h > panel_content_h
+                        ? s->compose_canvas_h : panel_content_h)
+                   + STATUS_H;
+        return;
+    }
+
     s->canvas_w = s->chr_cols * TILE_W * s->zoom;
     s->canvas_h = s->chr_rows * TILE_H * s->zoom;
 
@@ -103,6 +145,24 @@ static void state_init(EditorState *s, const char *path, int cols, int rows) {
     s->anim_cur          = 0;
     s->anim_frame_count  = 1;
     /* anim_preview_zoom already set to 1 above before state_update_dims */
+
+    /* Compose mode */
+    s->compose_mode       = false;
+    compose_init(&s->compose);
+    s->compose_layer      = COMPOSE_BG;
+    s->brush_tile         = 0;
+    s->brush_hflip        = false;
+    s->brush_vflip        = false;
+    s->compose_zoom       = 2;
+    s->compose_hover_x    = -1;
+    s->compose_hover_y    = -1;
+    s->compose_spr_sel    = -1;
+    s->compose_spr_drag   = -1;
+    s->compose_show_attr_grid = true;
+    s->compose_show_help  = false;
+    s->want_save_scene    = false;
+    s->want_load_scene    = false;
+    s->scene_path[0]      = '\0';
 
     snprintf(s->current_path, sizeof(s->current_path), "%s", path);
 }
@@ -185,6 +245,10 @@ int main(int argc, char *argv[]) {
                 make_pal_path(pp, sizeof(pp), arg_path);
                 if (palette_load(&state.pal, pp) == 0)
                     state.view_mode = VIEW_NES_COLOR;
+                /* Auto-load scene sidecar if present */
+                char sp[260];
+                make_scn_path(sp, sizeof(sp), arg_path);
+                compose_load(&state.compose, sp); /* silent, ok if missing */
             }
         }
     }
@@ -205,6 +269,12 @@ int main(int argc, char *argv[]) {
                 char pp[260];
                 make_pal_path(pp, sizeof(pp), state.current_path);
                 palette_save(&state.pal, pp); /* silent sidecar */
+                /* Auto-save scene sidecar if compose has data */
+                if (state.compose.scene_count > 0) {
+                    char sp[260];
+                    make_scn_path(sp, sizeof(sp), state.current_path);
+                    compose_save(&state.compose, sp);
+                }
             } else {
                 snprintf(msg, sizeof(msg), "ERROR saving %s", state.current_path);
             }
@@ -226,9 +296,41 @@ int main(int argc, char *argv[]) {
                 make_pal_path(pp, sizeof(pp), state.current_path);
                 if (palette_load(&state.pal, pp) == 0)
                     state.view_mode = VIEW_NES_COLOR;
+                /* Auto-load scene sidecar */
+                char sp[260];
+                make_scn_path(sp, sizeof(sp), state.current_path);
+                compose_load(&state.compose, sp); /* silent */
             } else {
                 snprintf(msg, sizeof(msg), "ERROR opening %s", state.current_path);
             }
+            set_title(win, msg);
+        }
+
+        /* ── Scene save/load ── */
+        if (state.want_save_scene) {
+            state.want_save_scene = false;
+            char sp[260], msg[300];
+            if (state.scene_path[0] == '\0')
+                make_scn_path(sp, sizeof(sp), state.current_path);
+            else
+                snprintf(sp, sizeof(sp), "%s", state.scene_path);
+            if (compose_save(&state.compose, sp) == 0)
+                snprintf(msg, sizeof(msg), "scene saved: %s", sp);
+            else
+                snprintf(msg, sizeof(msg), "ERROR saving scene: %s", sp);
+            set_title(win, msg);
+        }
+        if (state.want_load_scene) {
+            state.want_load_scene = false;
+            char sp[260], msg[300];
+            if (state.scene_path[0] == '\0')
+                make_scn_path(sp, sizeof(sp), state.current_path);
+            else
+                snprintf(sp, sizeof(sp), "%s", state.scene_path);
+            if (compose_load(&state.compose, sp) == 0)
+                snprintf(msg, sizeof(msg), "scene loaded: %s", sp);
+            else
+                snprintf(msg, sizeof(msg), "ERROR loading scene: %s", sp);
             set_title(win, msg);
         }
 

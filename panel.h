@@ -41,3 +41,6 @@
 
 /* ── Section 5: Tile edit mode (replaces normal panel when active) ── */
 #define PANEL_EDIT_MARGIN   4    /* margin around enlarged tile in panel */
+
+/* ── Section 6: Compose mode ─────────────────────────────────────── */
+#define COMPOSE_PICKER_SCALE 2   /* CHR picker drawn at 2x in compose panel */
