@@ -32,7 +32,7 @@
 #define PANEL_NES_ROWS       4
 #define PANEL_NES_GAP        1   /* px gap between cells (fixed)    */
 #define PANEL_NES_CELL_BASE  3   /* cell_px = zoom * this           */
-#define PANEL_NES_Y0        (PANEL_ACT_Y0 + PANEL_ACT_SH + 10)
+#define PANEL_NES_Y0        (PANEL_ACT_Y0 + PANEL_ACT_SH + 24)
 
 /* ── Section 4: Animation (below help button) ────────────────────*/
 /* Preview size and section height are computed at runtime from

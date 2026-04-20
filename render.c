@@ -104,7 +104,7 @@ static SDL_Color get_display_color(const EditorState *s, int tile, int val) {
         return GRAY_RAMP[val & 3];
 
     uint8_t sub    = s->pal.tile_pal[tile];
-    uint8_t master = s->pal.sub[sub & 7].idx[val & 3] & 0x3F;
+    uint8_t master = s->pal.sub[sub & (PAL_COUNT - 1)].idx[val & 3] & 0x3F;
     return NES_MASTER_PALETTE[master];
 }
 
@@ -400,15 +400,19 @@ static void render_status(SDL_Renderer *ren, const EditorState *s) {
     if (s->wrap_mode == WRAP_V || s->wrap_mode == WRAP_BOTH)
         vline(ren, tx + SW / 2, SY + 1, SH - 2, 0, 0, 0);
 
-    /* Tile address display — shows tile index + CHR byte offset under cursor */
+    /* Tile address display — shows tile index + PPU address under cursor */
     if (s->show_addr) {
         int mx = s->mouse_x, my = s->mouse_y;
         int ty_addr = STATUS_Y + (STATUS_H - font_line_h()) / 2 + 1;
         if (mx >= 0 && mx < s->canvas_w && my >= 0 && my < s->canvas_h) {
             int tile = screen_to_tile_idx(s, mx, my);
-            int addr = tile * 16;
-            char abuf[24];
-            snprintf(abuf, sizeof(abuf), "#$%02X @$%04X", tile, addr);
+            /* PPU address: tiles 0-255 in PT0 ($0000), 256-511 in PT1 ($1000) */
+            int pt       = tile / 256;
+            int pt_tile  = tile % 256;
+            int ppu_addr = pt * 0x1000 + pt_tile * 16;
+            char abuf[40];
+            snprintf(abuf, sizeof(abuf), "#%d PT%d:$%02X PPU:$%04X",
+                     tile, pt, pt_tile, ppu_addr);
             static const SDL_Color ACOL = {180, 220, 160, 255};
             font_draw_str(ren, abuf, 96, ty_addr, ACOL);
         } else {
@@ -464,8 +468,10 @@ static void render_anim_section(SDL_Renderer *ren, const EditorState *s,
     const char *hint;
     if      (s->anim_state == ANIM_PICKING_FIRST) hint = "PICK 1ST";
     else if (s->anim_state == ANIM_PICKING_LAST)  hint = "PICK LST";
-    else                                           hint = "A:EXIT";
-    font_draw_str(ren, hint, BX + PANEL_PAL_X0 + 5 * font_char_w(), anim_y0, DIM);
+    else if (s->anim_playing)                      hint = "PLAYING";
+    else                                           hint = "PAUSED";
+    SDL_Color hint_col = (s->anim_playing) ? CYN : DIM;
+    font_draw_str(ren, hint, BX + PANEL_PAL_X0 + 5 * font_char_w(), anim_y0, hint_col);
 
     /* Dynamic preview size: 4 screen px per NES px × anim_preview_zoom.
        sprite-8 → 32 or 64; sprite-16 → 64 or 128. Capped to panel width. */
@@ -524,11 +530,12 @@ static void render_anim_section(SDL_Renderer *ren, const EditorState *s,
         }
     }
 
-    /* Frame counter */
+    /* Frame counter + speed */
     int counter_y = preview_y + preview_sz + 6;
     if (s->anim_state == ANIM_ACTIVE) {
-        char cbuf[24];
-        snprintf(cbuf, sizeof(cbuf), "%d/%d", s->anim_cur + 1, s->anim_frame_count);
+        char cbuf[32];
+        snprintf(cbuf, sizeof(cbuf), "%d/%d  %dFPS",
+                 s->anim_cur + 1, s->anim_frame_count, s->anim_speed);
         int cw = (int)strlen(cbuf) * font_char_w();
         font_draw_str(ren, cbuf, BX + (s->panel_w - cw) / 2, counter_y, WHT);
     }
@@ -659,35 +666,49 @@ static void render_panel(SDL_Renderer *ren, const EditorState *s) {
 
     fill(ren, BX, 0, s->panel_w, s->win_h - STATUS_H, 18, 18, 30);
 
-    for (int i = 0; i < 8; i++) {
+    int scroll = s->palette_scroll;
+    if (scroll < 0) scroll = 0;
+    if (scroll > PAL_COUNT - PAL_VISIBLE) scroll = PAL_COUNT - PAL_VISIBLE;
+
+    static const SDL_Color AMBR = {220, 200,  40, 255};
+    static const SDL_Color LBL  = {140, 140, 170, 255};
+
+    for (int i = 0; i < PAL_VISIBLE; i++) {
+        int pal_idx = scroll + i;
         int ry = PANEL_PAL_Y0 + i * PANEL_PAL_ROW;
 
-        if (i == s->active_sub_pal)
+        if (pal_idx == s->active_sub_pal)
             fill(ren, BX + PANEL_PAL_X0 - 1, ry - 1,
                  4*(PANEL_PAL_SW + PANEL_PAL_XGAP) + 1, PANEL_PAL_SH + 2,
                  50, 50, 80);
 
-        if (i < 4)
-            fill(ren, BX + 1, ry, 2, PANEL_PAL_SH,  50,  80, 160);
-        else
-            fill(ren, BX + 1, ry, 2, PANEL_PAL_SH, 160,  60,  60);
+        /* Role bar: blue=BG(0-3), red=SPR(4-7), purple=EXT(8+) */
+        uint8_t br, bg, bb;
+        if (pal_idx < 4)      { br =  50; bg =  80; bb = 160; }
+        else if (pal_idx < 8) { br = 160; bg =  60; bb =  60; }
+        else                  { br = 110; bg =  70; bb = 160; }
+        fill(ren, BX + 1, ry, 2, PANEL_PAL_SH, br, bg, bb);
 
         for (int j = 0; j < 4; j++) {
             int sx = BX + PANEL_PAL_X0 + j * (PANEL_PAL_SW + PANEL_PAL_XGAP);
-            SDL_Color c = NES_MASTER_PALETTE[s->pal.sub[i].idx[j] & 0x3F];
+            SDL_Color c = NES_MASTER_PALETTE[s->pal.sub[pal_idx].idx[j] & 0x3F];
             fill(ren, sx, ry, PANEL_PAL_SW, PANEL_PAL_SH, c.r, c.g, c.b);
         }
 
-        /* Active-palette marker: amber * to the right of the swatches */
-        if (i == s->active_sub_pal) {
-            static const SDL_Color MARKC = {220, 200, 40, 255};
-            font_draw_char(ren, '*', BX + 104, ry - 2, MARKC);
-        }
+        /* Hex index label on the right (2 chars fit in ~24px); active = amber */
+        char lbl[4];
+        snprintf(lbl, sizeof(lbl), "%02X", pal_idx);
+        font_draw_str(ren, lbl, BX + 102, ry - 2,
+                      (pal_idx == s->active_sub_pal) ? AMBR : LBL);
     }
 
-    {
-        int sep = PANEL_PAL_Y0 + 4 * PANEL_PAL_ROW - 3;
-        hline(ren, BX + 2, sep, s->panel_w - 4, 55, 55, 80);
+    /* Separators between BG/SPR (3↔4) and SPR/EXT (7↔8) if visible. */
+    for (int boundary = 4; boundary <= 8; boundary += 4) {
+        int vis = boundary - scroll;
+        if (vis > 0 && vis < PAL_VISIBLE) {
+            int sep = PANEL_PAL_Y0 + vis * PANEL_PAL_ROW - 3;
+            hline(ren, BX + 2, sep, s->panel_w - 4, 55, 55, 80);
+        }
     }
 
     hline(ren, BX + 2, PANEL_ACT_Y0 - 4, s->panel_w - 4, 55, 55, 80);
@@ -702,10 +723,16 @@ static void render_panel(SDL_Renderer *ren, const EditorState *s) {
             fill(ren, sx-1, PANEL_ACT_Y0-1, PANEL_ACT_SW+2, PANEL_ACT_SH+2,
                  60, 60, 70);
 
-        SDL_Color c = NES_MASTER_PALETTE[
-            s->pal.sub[s->active_sub_pal].idx[j] & 0x3F];
+        uint8_t idx_j = s->pal.sub[s->active_sub_pal].idx[j] & 0x3F;
+        SDL_Color c = NES_MASTER_PALETTE[idx_j];
         fill(ren, sx, PANEL_ACT_Y0, PANEL_ACT_SW, PANEL_ACT_SH,
              c.r, c.g, c.b);
+
+        /* Show hex value below swatch */
+        char hex[5];
+        snprintf(hex, sizeof(hex), "$%02X", idx_j);
+        static const SDL_Color HEX_COL = {160, 160, 180, 255};
+        font_draw_str(ren, hex, sx, PANEL_ACT_Y0 + PANEL_ACT_SH + 2, HEX_COL);
     }
 
     hline(ren, BX + 2, PANEL_NES_Y0 - 4, s->panel_w - 4, 55, 55, 80);
@@ -751,14 +778,20 @@ static void render_panel(SDL_Renderer *ren, const EditorState *s) {
 static void render_help_overlay(SDL_Renderer *ren, const EditorState *s) {
     if (!s->show_help) return;
 
+    int panel_h = s->win_h - STATUS_H;
+
     SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
     SDL_SetRenderDrawColor(ren, 0, 0, 18, 228);
-    SDL_Rect bg = {0, 0, s->win_w, s->win_h - STATUS_H};
+    SDL_Rect bg = {0, 0, s->win_w, panel_h};
     SDL_RenderFillRect(ren, &bg);
     SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
 
     SDL_SetRenderDrawColor(ren, 60, 80, 180, 255);
     SDL_RenderDrawRect(ren, &bg);
+
+    /* Clip to overlay area */
+    SDL_Rect clip = {0, 0, s->win_w, panel_h};
+    SDL_RenderSetClipRect(ren, &clip);
 
     static const SDL_Color WHT = {210, 210, 210, 255};
     static const SDL_Color DIM = {120, 120, 150, 255};
@@ -766,7 +799,7 @@ static void render_help_overlay(SDL_Renderer *ren, const EditorState *s) {
     static const SDL_Color CYN = {100, 190, 210, 255};
 
     int x  = 20;
-    int y  = 14;
+    int y  = 14 - s->help_scroll;
     int lh = font_line_h();
     int hg = lh / 2;
 
@@ -789,12 +822,22 @@ static void render_help_overlay(SDL_Renderer *ren, const EditorState *s) {
     font_draw_str(ren, " G      TILE GRID",               x, y, WHT); y += lh;
     font_draw_str(ren, " P      PIXEL GRID",              x, y, WHT); y += lh;
     font_draw_str(ren, " M      SPRITE 16 MODE",          x, y, WHT); y += lh;
-    font_draw_str(ren, " N      SHOW TILE ADDRESS",        x, y, WHT); y += lh + hg;
+    font_draw_str(ren, " N      SHOW TILE ADDRESS",       x, y, WHT); y += lh + hg;
+
+    font_draw_str(ren, "ANIMATION",                       x, y, CYN); y += lh;
+    font_draw_str(ren, " A      START/STOP ANIM MODE",    x, y, WHT); y += lh;
+    font_draw_str(ren, " SPACE  PLAY / PAUSE",            x, y, WHT); y += lh;
+    font_draw_str(ren, " LEFT/RIGHT  STEP FRAMES (WRAP)", x, y, WHT); y += lh;
+    font_draw_str(ren, " < / >  DECREASE/INCREASE FPS",   x, y, WHT); y += lh;
+    font_draw_str(ren, " CLICK PREVIEW  TOGGLE ZOOM",     x, y, WHT); y += lh + hg;
 
     font_draw_str(ren, "EDIT",                             x, y, CYN); y += lh;
     font_draw_str(ren, " CTRL+Z  UNDO",                   x, y, WHT); y += lh;
     font_draw_str(ren, " CTRL+SHFT+Z REDO (OR CTRL+Y)",   x, y, WHT); y += lh;
-    font_draw_str(ren, " CTRL+C/V/X  COPY/PASTE/CUT",     x, y, WHT); y += lh + hg;
+    font_draw_str(ren, " CTRL+C/V/X  COPY/PASTE/CUT TILE",x, y, WHT); y += lh;
+    font_draw_str(ren, " CTRL+SHFT+C COPY PAL AS .DB",    x, y, WHT); y += lh;
+    font_draw_str(ren, " CTRL+SHFT+V PASTE PAL FROM .DB", x, y, WHT); y += lh;
+    font_draw_str(ren, " WHEEL ON PANEL SCROLLS PALETTES",x, y, WHT); y += lh + hg;
 
     font_draw_str(ren, "FILES & CANVAS",                  x, y, CYN); y += lh;
     font_draw_str(ren, " CTRL+S      SAVE",               x, y, WHT); y += lh;
@@ -810,8 +853,9 @@ static void render_help_overlay(SDL_Renderer *ren, const EditorState *s) {
     font_draw_str(ren, " TAB         COMPOSE MODE",       x, y, WHT); y += lh + hg;
 
     font_draw_str(ren, " F1 OR ?   TOGGLE HELP",          x, y, DIM); y += lh;
-    font_draw_str(ren, " ESC       QUIT",                 x, y, DIM);
-    (void)y;
+    font_draw_str(ren, " SCROLL    PAGE UP/DOWN",          x, y, DIM);
+
+    SDL_RenderSetClipRect(ren, NULL);
 }
 
 /* ── Text-input overlay ───────────────────────────────────────── */
@@ -1121,30 +1165,42 @@ static void render_compose_panel(SDL_Renderer *ren, const EditorState *s) {
     }
     y += 32 + 8;
 
-    /* Palette rows */
+    /* Palette rows (scrollable: shows PAL_VISIBLE of PAL_COUNT). */
     font_draw_str(ren, "PAL", ctrl_x, y, DIM);
     y += font_line_h();
 
-    for (int i = 0; i < 8; i++) {
+    int pscroll = s->palette_scroll;
+    if (pscroll < 0) pscroll = 0;
+    if (pscroll > PAL_COUNT - PAL_VISIBLE) pscroll = PAL_COUNT - PAL_VISIBLE;
+
+    for (int i = 0; i < PAL_VISIBLE; i++) {
+        int pal_idx = pscroll + i;
         int ry = y + i * 14;
 
-        if (i == s->active_sub_pal)
+        if (pal_idx == s->active_sub_pal)
             fill(ren, ctrl_x - 1, ry - 1,
                  4 * (10 + 2) + 1, 10 + 2, 50, 50, 80);
 
-        /* BG/SPR indicator */
-        if (i < 4)
-            fill(ren, ctrl_x - 3, ry, 2, 10, 50, 80, 160);
-        else
-            fill(ren, ctrl_x - 3, ry, 2, 10, 160, 60, 60);
+        /* Role bar: blue=BG (0-3), red=SPR (4-7), purple=EXT library (8+) */
+        uint8_t br, bg, bb;
+        if (pal_idx < 4)      { br =  50; bg =  80; bb = 160; }
+        else if (pal_idx < 8) { br = 160; bg =  60; bb =  60; }
+        else                  { br = 110; bg =  70; bb = 160; }
+        fill(ren, ctrl_x - 3, ry, 2, 10, br, bg, bb);
 
         for (int j = 0; j < 4; j++) {
             int sx = ctrl_x + j * 12;
-            SDL_Color c = NES_MASTER_PALETTE[s->pal.sub[i].idx[j] & 0x3F];
+            SDL_Color c = NES_MASTER_PALETTE[s->pal.sub[pal_idx].idx[j] & 0x3F];
             fill(ren, sx, ry, 10, 10, c.r, c.g, c.b);
         }
+
+        /* Hex index after the 4 swatches: " NN" */
+        char lbl[4];
+        snprintf(lbl, sizeof(lbl), "%02X", pal_idx);
+        font_draw_str(ren, lbl, ctrl_x + 4 * 12 + 2, ry - 2,
+                      (pal_idx == s->active_sub_pal) ? YLW : DIM);
     }
-    y += 8 * 14 + 8;
+    y += PAL_VISIBLE * 14 + 8;
 
     /* Layer toggle */
     {
@@ -1236,14 +1292,20 @@ static void render_compose_status(SDL_Renderer *ren, const EditorState *s) {
 static void render_compose_help(SDL_Renderer *ren, const EditorState *s) {
     if (!s->compose_show_help) return;
 
+    int panel_h = s->win_h - STATUS_H;
+
     SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
     SDL_SetRenderDrawColor(ren, 0, 0, 18, 228);
-    SDL_Rect bg = {0, 0, s->win_w, s->win_h - STATUS_H};
+    SDL_Rect bg = {0, 0, s->win_w, panel_h};
     SDL_RenderFillRect(ren, &bg);
     SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
 
     SDL_SetRenderDrawColor(ren, 120, 60, 180, 255);
     SDL_RenderDrawRect(ren, &bg);
+
+    /* Clip to overlay area */
+    SDL_Rect clip = {0, 0, s->win_w, panel_h};
+    SDL_RenderSetClipRect(ren, &clip);
 
     static const SDL_Color WHT = {210, 210, 210, 255};
     static const SDL_Color DIM = {120, 120, 150, 255};
@@ -1251,7 +1313,7 @@ static void render_compose_help(SDL_Renderer *ren, const EditorState *s) {
     static const SDL_Color CYN = {100, 190, 210, 255};
 
     int x  = 20;
-    int y  = 14;
+    int y  = 14 - s->help_scroll;
     int lh = font_line_h();
     int hg = lh / 2;
 
@@ -1279,7 +1341,11 @@ static void render_compose_help(SDL_Renderer *ren, const EditorState *s) {
 
     font_draw_str(ren, "EDIT",                             x, y, CYN); y += lh;
     font_draw_str(ren, " CTRL+Z  UNDO",                   x, y, WHT); y += lh;
-    font_draw_str(ren, " CTRL+SHFT+Z REDO",               x, y, WHT); y += lh + hg;
+    font_draw_str(ren, " CTRL+SHFT+Z REDO",               x, y, WHT); y += lh;
+    font_draw_str(ren, " CTRL+SHFT+C COPY PAL AS .DB",    x, y, WHT); y += lh;
+    font_draw_str(ren, " CTRL+SHFT+V PASTE PAL FROM .DB", x, y, WHT); y += lh;
+    font_draw_str(ren, " WHEEL ON PANEL SCROLLS PALETTES",x, y, WHT); y += lh;
+    font_draw_str(ren, " CLICK LIB PAL SWAPS INTO SLOT",  x, y, WHT); y += lh + hg;
 
     font_draw_str(ren, "VIEW & SCENES",                   x, y, CYN); y += lh;
     font_draw_str(ren, " G       TOGGLE ATTR GRID",       x, y, WHT); y += lh;
@@ -1289,8 +1355,10 @@ static void render_compose_help(SDL_Renderer *ren, const EditorState *s) {
     font_draw_str(ren, " CTRL+S  SAVE SCENE FILE",        x, y, WHT); y += lh + hg;
 
     font_draw_str(ren, " TAB/ESC EXIT COMPOSE",           x, y, DIM); y += lh;
+    font_draw_str(ren, " SCROLL  PAGE UP/DOWN",            x, y, DIM); y += lh;
     font_draw_str(ren, " F1 OR ? TOGGLE HELP",            x, y, DIM);
-    (void)y;
+
+    SDL_RenderSetClipRect(ren, NULL);
 }
 
 /* ── Main render entry ────────────────────────────────────────── */

@@ -62,9 +62,11 @@ int chr_load(ChrPage *c, const char *path) {
 int palette_save(const PaletteState *p, const char *path) {
     FILE *f = fopen(path, "wb");
     if (!f) return -1;
-    int ok = (fwrite("NPAL", 1, 4, f) == 4 &&
-              fwrite(p->sub,      1, sizeof(p->sub),      f) == sizeof(p->sub) &&
-              fwrite(p->tile_pal, 1, sizeof(p->tile_pal), f) == sizeof(p->tile_pal));
+    uint8_t hdr[2] = { (uint8_t)PAL_COUNT, 0 };
+    int ok = (fwrite("NPL2",     1, 4,                  f) == 4 &&
+              fwrite(hdr,        1, sizeof(hdr),        f) == sizeof(hdr) &&
+              fwrite(p->sub,     1, sizeof(p->sub),     f) == sizeof(p->sub) &&
+              fwrite(p->tile_pal,1, sizeof(p->tile_pal),f) == sizeof(p->tile_pal));
     fclose(f);
     return ok ? 0 : -1;
 }
@@ -73,12 +75,33 @@ int palette_load(PaletteState *p, const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
     char magic[4];
-    int ok = (fread(magic,      1, 4,                  f) == 4 &&
-              memcmp(magic, "NPAL", 4) == 0 &&
-              fread(p->sub,      1, sizeof(p->sub),      f) == sizeof(p->sub) &&
-              fread(p->tile_pal, 1, sizeof(p->tile_pal), f) == sizeof(p->tile_pal));
+    if (fread(magic, 1, 4, f) != 4) { fclose(f); return -1; }
+
+    memset(p, 0, sizeof(*p));
+
+    if (memcmp(magic, "NPL2", 4) == 0) {
+        uint8_t hdr[2];
+        if (fread(hdr, 1, 2, f) != 2) { fclose(f); return -1; }
+        int count = hdr[0];
+        if (count > PAL_COUNT) count = PAL_COUNT;
+        size_t bytes = (size_t)count * sizeof(SubPalette);
+        if (fread(p->sub,     1, bytes,               f) != bytes)               { fclose(f); return -1; }
+        if (fread(p->tile_pal,1, sizeof(p->tile_pal), f) != sizeof(p->tile_pal)) { fclose(f); return -1; }
+        fclose(f);
+        return 0;
+    }
+
+    if (memcmp(magic, "NPAL", 4) == 0) {
+        /* Legacy: 8 sub-palettes + tile_pal. Remaining slots stay zero. */
+        size_t bytes = 8u * sizeof(SubPalette);
+        if (fread(p->sub,     1, bytes,               f) != bytes)               { fclose(f); return -1; }
+        if (fread(p->tile_pal,1, sizeof(p->tile_pal), f) != sizeof(p->tile_pal)) { fclose(f); return -1; }
+        fclose(f);
+        return 0;
+    }
+
     fclose(f);
-    return ok ? 0 : -1;
+    return -1;
 }
 
 void palette_init(PaletteState *p) {

@@ -122,10 +122,11 @@ static void state_init(EditorState *s, const char *path, int cols, int rows) {
     s->color           = 3;
     s->active_sub_pal  = 0;
     s->active_swatch   = 1;
+    s->palette_scroll  = 0;
     s->tile_mode       = false;
     s->sel_tile_x      = 0;
     s->sel_tile_y      = 0;
-    s->sprite_mode     = SPRITE_16;
+    s->sprite_mode     = SPRITE_8;
     s->wrap_mode       = WRAP_NONE;
     s->mouse_down       = false;
     s->right_mouse_down = false;
@@ -145,6 +146,9 @@ static void state_init(EditorState *s, const char *path, int cols, int rows) {
     s->anim_cur          = 0;
     s->anim_frame_count  = 1;
     /* anim_preview_zoom already set to 1 above before state_update_dims */
+    s->anim_playing      = false;
+    s->anim_speed        = 8;
+    s->anim_last_tick    = 0;
 
     /* Compose mode */
     s->compose_mode       = false;
@@ -366,6 +370,16 @@ int main(int argc, char *argv[]) {
             SDL_SetWindowPosition(win, SDL_WINDOWPOS_CENTERED,
                                       SDL_WINDOWPOS_CENTERED);
             render_resize(ren, &state);
+        }
+
+        /* ── Animation playback ── */
+        if (state.anim_playing && state.anim_state == ANIM_ACTIVE) {
+            uint32_t now = SDL_GetTicks();
+            uint32_t interval = (state.anim_speed > 0) ? 1000 / state.anim_speed : 125;
+            if (now - state.anim_last_tick >= interval) {
+                state.anim_cur = (state.anim_cur + 1) % state.anim_frame_count;
+                state.anim_last_tick = now;
+            }
         }
 
         render_frame(ren, &state);

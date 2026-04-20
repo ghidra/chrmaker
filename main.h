@@ -55,8 +55,9 @@ typedef struct {
     int          color;
 
     /* Palette panel */
-    int          active_sub_pal;    /* 0-7 */
+    int          active_sub_pal;    /* 0..PAL_COUNT-1 */
     int          active_swatch;     /* 0-3: slot being edited in active sub-pal */
+    int          palette_scroll;    /* scroll offset into pal.sub[]: 0..PAL_COUNT-PAL_VISIBLE */
 
     /* Sprite display mode */
     SpriteMode   sprite_mode;
@@ -71,6 +72,7 @@ typedef struct {
     /* Input */
     bool         mouse_down;
     bool         right_mouse_down;
+    bool         drag_in_edit_panel;   /* drag started in tile-edit panel     */
     int          mouse_x, mouse_y;   /* current screen cursor position */
 
     /* File operations */
@@ -89,6 +91,7 @@ typedef struct {
 
     /* Help overlay */
     bool         show_help;
+    int          help_scroll;       /* scroll offset in pixels (both overlays) */
 
     /* Address overlay — show tile index + CHR byte offset in status bar */
     bool         show_addr;
@@ -100,6 +103,9 @@ typedef struct {
     int          anim_cur;          /* current frame index (0-based)              */
     int          anim_frame_count;  /* total number of frames                     */
     int          anim_preview_zoom; /* preview scale: 1 or 2 (click preview to toggle) */
+    bool         anim_playing;      /* auto-advance frames when true              */
+    int          anim_speed;        /* frames per second (default 8)              */
+    uint32_t     anim_last_tick;    /* SDL_GetTicks() of last frame advance       */
 
     /* Clipboard (tile copy/paste in tile mode) */
     bool         has_clipboard;

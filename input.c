@@ -1,8 +1,11 @@
 #include "input.h"
 #include "panel.h"
 #include "compose.h"
+#include "font.h"
 #include <string.h>
 #include <stdio.h>
+#include <ctype.h>
+#include <stdbool.h>
 
 /* ── Undo / redo ring buffer ──────────────────────────────────── */
 
@@ -75,6 +78,69 @@ static void undo_redo_pop(EditorState *s) {
 /* ── Helpers ──────────────────────────────────────────────────── */
 
 static int wmod(int v, int n) { return ((v % n) + n) % n; }
+
+/* ── Palette clipboard (assembly-style hex bytes via system clipboard) ── */
+
+static void pal_copy_to_clipboard(const EditorState *s) {
+    const SubPalette *sp = &s->pal.sub[s->active_sub_pal];
+    char buf[64];
+    snprintf(buf, sizeof(buf), ".db $%02X,$%02X,$%02X,$%02X",
+             sp->idx[0] & 0x3F, sp->idx[1] & 0x3F,
+             sp->idx[2] & 0x3F, sp->idx[3] & 0x3F);
+    SDL_SetClipboardText(buf);
+}
+
+/* Parse the first 4 NES hex bytes out of an assembly-style string.
+   Accepts `$XX`, `0xXX`, or bare `XX` (when preceded by a separator).
+   Stops at `;` (comment). Returns true iff exactly 4 bytes were read. */
+static bool pal_parse_bytes(const char *txt, uint8_t out[4]) {
+    int count = 0;
+    const char *p = txt;
+    char prev = ' ';
+    while (*p && *p != ';' && count < 4) {
+        int v = 0, n = 0;
+        bool begin = false;
+
+        if (*p == '$') {
+            p++; begin = true;
+        } else if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X') &&
+                   isxdigit((unsigned char)p[2])) {
+            p += 2; begin = true;
+        } else if (isxdigit((unsigned char)*p) &&
+                   (prev == ' ' || prev == '\t' || prev == ',' ||
+                    prev == '\n' || prev == '\r' || prev == '(' ||
+                    prev == '{'  || prev == '[')) {
+            begin = true;
+        }
+
+        if (!begin) { prev = *p; p++; continue; }
+
+        while (n < 2 && isxdigit((unsigned char)*p)) {
+            int d = (*p >= '0' && *p <= '9') ? *p - '0'
+                  : (*p >= 'a' && *p <= 'f') ? *p - 'a' + 10
+                  : *p - 'A' + 10;
+            v = v * 16 + d;
+            prev = *p;
+            p++; n++;
+        }
+        if (n > 0) out[count++] = (uint8_t)(v & 0x3F);
+    }
+    return count == 4;
+}
+
+/* Returns true and pushes undo if the active palette was updated. */
+static bool pal_paste_from_clipboard(EditorState *s) {
+    char *text = SDL_GetClipboardText();
+    if (!text) return false;
+    uint8_t bytes[4];
+    bool ok = pal_parse_bytes(text, bytes);
+    SDL_free(text);
+    if (!ok) return false;
+    undo_push(s);
+    SubPalette *sp = &s->pal.sub[s->active_sub_pal];
+    for (int i = 0; i < 4; i++) sp->idx[i] = bytes[i];
+    return true;
+}
 
 /* ── File-based clipboard (cross-instance copy/paste) ────────── */
 
@@ -221,26 +287,25 @@ static void tile_edit_paint(EditorState *s, int px, int py) {
     int edit_x0  = (s->panel_w - edit_sz) / 2;
     int edit_y0  = PANEL_EDIT_MARGIN + 20;
 
-    if (px < edit_x0 || px >= edit_x0 + edit_sz ||
-        py < edit_y0 || py >= edit_y0 + edit_sz) return;
-
-    int lx = (px - edit_x0) / pixel_sz;
-    int ly = (py - edit_y0) / pixel_sz;
+    int ox = px - edit_x0;
+    int oy = py - edit_y0;
 
     bool wx = (s->wrap_mode == WRAP_H || s->wrap_mode == WRAP_BOTH);
     bool wy = (s->wrap_mode == WRAP_V || s->wrap_mode == WRAP_BOTH);
 
+    if (wx) ox = wmod(ox, edit_sz); else if (ox < 0 || ox >= edit_sz) return;
+    if (wy) oy = wmod(oy, edit_sz); else if (oy < 0 || oy >= edit_sz) return;
+
+    int lx = ox / pixel_sz;
+    int ly = oy / pixel_sz;
+
     if (s16) {
-        if (wx) lx = wmod(lx, 16); else if (lx < 0 || lx >= 16) return;
-        if (wy) ly = wmod(ly, 16); else if (ly < 0 || ly >= 16) return;
         int sub_x = lx / TILE_W;
         int sub_y = ly / TILE_H;
         int p     = sub_x * 2 + sub_y;
         int tile  = sel_tile_idx(s) + p;
         s->chr.px[tile][ly % TILE_H][lx % TILE_W] = (uint8_t)s->color;
     } else {
-        if (wx) lx = wmod(lx, 8); else if (lx < 0 || lx >= 8) return;
-        if (wy) ly = wmod(ly, 8); else if (ly < 0 || ly >= 8) return;
         int tile = sel_tile_idx(s);
         s->chr.px[tile][ly][lx] = (uint8_t)s->color;
     }
@@ -320,15 +385,17 @@ static void panel_click(EditorState *s, int px, int py) {
     int nes_x0        = (s->panel_w - PANEL_NES_COLS * nes_step + PANEL_NES_GAP) / 2;
     int panel_view_y0 = PANEL_NES_Y0 + PANEL_NES_ROWS * nes_step + 10;
 
-    if (py >= PANEL_PAL_Y0 && py < PANEL_PAL_Y0 + 8 * PANEL_PAL_ROW) {
+    if (py >= PANEL_PAL_Y0 && py < PANEL_PAL_Y0 + PAL_VISIBLE * PANEL_PAL_ROW) {
         int row = (py - PANEL_PAL_Y0) / PANEL_PAL_ROW;
-        if (row < 0 || row > 7) return;
-        s->active_sub_pal = row;
+        if (row < 0 || row >= PAL_VISIBLE) return;
+        int pal_idx = s->palette_scroll + row;
+        if (pal_idx < 0 || pal_idx >= PAL_COUNT) return;
+        s->active_sub_pal = pal_idx;
         if (s->tile_mode) {
             int base = sel_tile_idx(s);
             int cnt  = (s->sprite_mode == SPRITE_16 && s->chr_cols >= 2) ? 4 : 1;
             for (int p = 0; p < cnt; p++)
-                s->pal.tile_pal[base + p] = (uint8_t)row;
+                s->pal.tile_pal[base + p] = (uint8_t)pal_idx;
         }
         return;
     }
@@ -350,8 +417,10 @@ static void panel_click(EditorState *s, int px, int py) {
     }
 
     if (py >= panel_view_y0 && py < panel_view_y0 + 16 &&
-        px >= 22 && px < 34)
+        px >= 22 && px < 34) {
         s->show_help = !s->show_help;
+        s->help_scroll = 0;
+    }
 
     /* Animation section hit-tests (preview + scrubber) */
     {
@@ -430,19 +499,33 @@ static void compose_panel_click(EditorState *s, int px, int py) {
     y += 18;      /* "BRUSH" label */
     y += 32 + 8;  /* preview + gap */
 
-    /* Palette rows */
+    /* Palette rows (scrollable) */
     int pal_label_y = y;
     y += 18;  /* "PAL" label */
     int pal_y0 = y;
     int pal_row_h = 14;
-    if (py >= pal_y0 && py < pal_y0 + 8 * pal_row_h) {
+    if (py >= pal_y0 && py < pal_y0 + PAL_VISIBLE * pal_row_h) {
         int row = (py - pal_y0) / pal_row_h;
-        if (row >= 0 && row <= 7)
-            s->active_sub_pal = row;
+        if (row < 0 || row >= PAL_VISIBLE) return;
+        int pal_idx = s->palette_scroll + row;
+        if (pal_idx < 0 || pal_idx >= PAL_COUNT) return;
+        if (pal_idx < 8) {
+            /* Regular slot — select, respecting layer constraint. */
+            if (s->compose_layer == COMPOSE_BG && pal_idx < 4)
+                s->active_sub_pal = pal_idx;
+            else if (s->compose_layer == COMPOSE_SPR && pal_idx >= 4)
+                s->active_sub_pal = pal_idx;
+            /* wrong-layer click: ignore silently */
+        } else {
+            /* Library palette — copy its colors into the active compose slot. */
+            int dst = s->active_sub_pal & 7;
+            undo_push(s);
+            s->pal.sub[dst] = s->pal.sub[pal_idx];
+        }
         return;
     }
     (void)pal_label_y;
-    y += 8 * pal_row_h + 8;
+    y += PAL_VISIBLE * pal_row_h + 8;
 
     /* Layer toggle */
     if (py >= y && py < y + 18) {
@@ -562,10 +645,13 @@ static void compose_input(const SDL_Event *e, EditorState *s) {
                     break;
                 case SDLK_F1:
                     s->compose_show_help = !s->compose_show_help;
+                    s->help_scroll = 0;
                     break;
                 case SDLK_SLASH:
-                    if (e->key.keysym.mod & KMOD_SHIFT)
+                    if (e->key.keysym.mod & KMOD_SHIFT) {
                         s->compose_show_help = !s->compose_show_help;
+                        s->help_scroll = 0;
+                    }
                     break;
                 case SDLK_b: s->compose_layer = COMPOSE_BG;  break;
                 case SDLK_l: s->compose_layer = COMPOSE_SPR; break;
@@ -630,6 +716,16 @@ static void compose_input(const SDL_Event *e, EditorState *s) {
                 case SDLK_y:
                     if (e->key.keysym.mod & KMOD_CTRL)
                         undo_redo_pop(s);
+                    break;
+                case SDLK_c:
+                    if ((e->key.keysym.mod & KMOD_CTRL) &&
+                        (e->key.keysym.mod & KMOD_SHIFT))
+                        pal_copy_to_clipboard(s);
+                    break;
+                case SDLK_v:
+                    if ((e->key.keysym.mod & KMOD_CTRL) &&
+                        (e->key.keysym.mod & KMOD_SHIFT))
+                        pal_paste_from_clipboard(s);
                     break;
                 case SDLK_s:
                     if (e->key.keysym.mod & KMOD_CTRL)
@@ -739,6 +835,19 @@ static void compose_input(const SDL_Event *e, EditorState *s) {
             break;
         }
 
+        case SDL_MOUSEWHEEL:
+            if (s->compose_show_help) {
+                s->help_scroll -= e->wheel.y * font_line_h() * 2;
+                if (s->help_scroll < 0) s->help_scroll = 0;
+            } else if (s->mouse_x >= cw) {
+                /* Wheel over compose panel → scroll the palette list. */
+                s->palette_scroll -= e->wheel.y;
+                int maxs = PAL_COUNT - PAL_VISIBLE;
+                if (s->palette_scroll < 0)    s->palette_scroll = 0;
+                if (s->palette_scroll > maxs) s->palette_scroll = maxs;
+            }
+            break;
+
         default: break;
     }
 }
@@ -800,7 +909,6 @@ void input_handle(const SDL_Event *e, EditorState *s) {
                     if (s->show_help)      s->show_help = false;
                     else if (s->tile_edit) s->tile_edit = false;
                     else if (s->tile_mode) s->tile_mode = false;
-                    else                   s->running   = false;
                     break;
 
                 case SDLK_z:
@@ -833,7 +941,10 @@ void input_handle(const SDL_Event *e, EditorState *s) {
                     }
                     break;
                 case SDLK_v:
-                    if ((e->key.keysym.mod & KMOD_CTRL) && s->tile_mode) {
+                    if ((e->key.keysym.mod & KMOD_CTRL) &&
+                        (e->key.keysym.mod & KMOD_SHIFT)) {
+                        pal_paste_from_clipboard(s);
+                    } else if ((e->key.keysym.mod & KMOD_CTRL) && s->tile_mode) {
                         clipboard_load(s);  /* refresh from file (cross-instance) */
                         if (s->has_clipboard) {
                             undo_push(s);
@@ -850,11 +961,14 @@ void input_handle(const SDL_Event *e, EditorState *s) {
                     break;
 
                 case SDLK_SLASH:
-                    if (e->key.keysym.mod & KMOD_SHIFT)
+                    if (e->key.keysym.mod & KMOD_SHIFT) {
                         s->show_help = !s->show_help;
+                        s->help_scroll = 0;
+                    }
                     break;
                 case SDLK_F1:
                     s->show_help = !s->show_help;
+                    s->help_scroll = 0;
                     break;
 
                 case SDLK_s:
@@ -874,7 +988,10 @@ void input_handle(const SDL_Event *e, EditorState *s) {
                         input_begin(s, INPUT_RESIZE);
                     break;
                 case SDLK_c:
-                    if ((e->key.keysym.mod & KMOD_CTRL) && s->tile_mode) {
+                    if ((e->key.keysym.mod & KMOD_CTRL) &&
+                        (e->key.keysym.mod & KMOD_SHIFT)) {
+                        pal_copy_to_clipboard(s);
+                    } else if ((e->key.keysym.mod & KMOD_CTRL) && s->tile_mode) {
                         int base = sel_tile_idx(s);
                         bool s16 = (s->sprite_mode == SPRITE_16 && s->chr_cols >= 2);
                         int cnt  = s16 ? 4 : 1;
@@ -936,8 +1053,10 @@ void input_handle(const SDL_Event *e, EditorState *s) {
                 case SDLK_a:
                     if (s->anim_state == ANIM_OFF)
                         s->anim_state = ANIM_PICKING_FIRST;
-                    else
-                        s->anim_state = ANIM_OFF;
+                    else {
+                        s->anim_state   = ANIM_OFF;
+                        s->anim_playing = false;
+                    }
                     break;
 
                 case SDLK_TAB:
@@ -948,13 +1067,31 @@ void input_handle(const SDL_Event *e, EditorState *s) {
                     break;
 
                 case SDLK_LEFT:
-                    if (s->anim_state == ANIM_ACTIVE && s->anim_cur > 0)
-                        s->anim_cur--;
+                    if (s->anim_state == ANIM_ACTIVE) {
+                        s->anim_playing = false;
+                        s->anim_cur = (s->anim_cur - 1 + s->anim_frame_count)
+                                      % s->anim_frame_count;
+                    }
                     break;
                 case SDLK_RIGHT:
-                    if (s->anim_state == ANIM_ACTIVE &&
-                        s->anim_cur < s->anim_frame_count - 1)
-                        s->anim_cur++;
+                    if (s->anim_state == ANIM_ACTIVE) {
+                        s->anim_playing = false;
+                        s->anim_cur = (s->anim_cur + 1) % s->anim_frame_count;
+                    }
+                    break;
+                case SDLK_SPACE:
+                    if (s->anim_state == ANIM_ACTIVE) {
+                        s->anim_playing = !s->anim_playing;
+                        s->anim_last_tick = SDL_GetTicks();
+                    }
+                    break;
+                case SDLK_COMMA:
+                    if (s->anim_state == ANIM_ACTIVE && s->anim_speed > 1)
+                        s->anim_speed--;
+                    break;
+                case SDLK_PERIOD:
+                    if (s->anim_state == ANIM_ACTIVE && s->anim_speed < 30)
+                        s->anim_speed++;
                     break;
 
                 case SDLK_t: select_tile_under_cursor(s); break;
@@ -968,7 +1105,8 @@ void input_handle(const SDL_Event *e, EditorState *s) {
                         int base = sel_tile_idx(s);
                         int cnt  = (s->sprite_mode == SPRITE_16 && s->chr_cols >= 2) ? 4 : 1;
                         for (int p = 0; p < cnt; p++)
-                            s->pal.tile_pal[base + p] = (s->pal.tile_pal[base + p] + 7) % 8;
+                            s->pal.tile_pal[base + p] =
+                                (uint8_t)((s->pal.tile_pal[base + p] + PAL_COUNT - 1) % PAL_COUNT);
                     }
                     break;
                 case SDLK_RIGHTBRACKET:
@@ -977,7 +1115,8 @@ void input_handle(const SDL_Event *e, EditorState *s) {
                         int base = sel_tile_idx(s);
                         int cnt  = (s->sprite_mode == SPRITE_16 && s->chr_cols >= 2) ? 4 : 1;
                         for (int p = 0; p < cnt; p++)
-                            s->pal.tile_pal[base + p] = (s->pal.tile_pal[base + p] + 1) % 8;
+                            s->pal.tile_pal[base + p] =
+                                (uint8_t)((s->pal.tile_pal[base + p] + 1) % PAL_COUNT);
                     }
                     break;
 
@@ -990,6 +1129,7 @@ void input_handle(const SDL_Event *e, EditorState *s) {
             s->mouse_x = mx; s->mouse_y = my;
             if (e->button.button == SDL_BUTTON_LEFT) {
                 s->mouse_down = true;
+                s->drag_in_edit_panel = (mx >= s->canvas_w && s->tile_edit);
                 /* Push undo before any canvas modification */
                 if (mx < s->canvas_w &&
                     s->anim_state != ANIM_PICKING_FIRST &&
@@ -1043,7 +1183,10 @@ void input_handle(const SDL_Event *e, EditorState *s) {
         }
 
         case SDL_MOUSEBUTTONUP:
-            if (e->button.button == SDL_BUTTON_LEFT)  s->mouse_down       = false;
+            if (e->button.button == SDL_BUTTON_LEFT) {
+                s->mouse_down = false;
+                s->drag_in_edit_panel = false;
+            }
             if (e->button.button == SDL_BUTTON_RIGHT) s->right_mouse_down = false;
             break;
 
@@ -1051,7 +1194,9 @@ void input_handle(const SDL_Event *e, EditorState *s) {
             int mx = e->motion.x, my = e->motion.y;
             s->mouse_x = mx; s->mouse_y = my;
             if (s->mouse_down) {
-                if (mx < s->canvas_w) {
+                if (s->drag_in_edit_panel) {
+                    tile_edit_paint(s, mx - s->canvas_w, my);
+                } else if (mx < s->canvas_w) {
                     if (s->anim_state != ANIM_PICKING_FIRST &&
                         s->anim_state != ANIM_PICKING_LAST)
                         paint_at(s, mx, my);
@@ -1066,6 +1211,23 @@ void input_handle(const SDL_Event *e, EditorState *s) {
                 assign_pal_at(s, mx, my);
             break;
         }
+
+        case SDL_MOUSEWHEEL:
+            if (s->show_help) {
+                s->help_scroll -= e->wheel.y * font_line_h() * 2;
+                if (s->help_scroll < 0) s->help_scroll = 0;
+            } else if (s->mouse_x >= s->canvas_w) {
+                /* Scroll the palette list when wheeling over the panel. */
+                int py = s->mouse_y;
+                if (py >= PANEL_PAL_Y0 &&
+                    py < PANEL_PAL_Y0 + PAL_VISIBLE * PANEL_PAL_ROW) {
+                    s->palette_scroll -= e->wheel.y;
+                    int maxs = PAL_COUNT - PAL_VISIBLE;
+                    if (s->palette_scroll < 0)    s->palette_scroll = 0;
+                    if (s->palette_scroll > maxs) s->palette_scroll = maxs;
+                }
+            }
+            break;
 
         default: break;
     }

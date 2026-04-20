@@ -17,7 +17,16 @@
 /* ── CHR capacity ─────────────────────────────────────────────── */
 #define CHR_MAX_TILES    1024  /* max tiles a ChrPage can hold         */
 #define CHR_DEFAULT_COLS   16  /* default tiles per row                */
-#define CHR_DEFAULT_ROWS   16  /* default tile rows                    */
+#define CHR_DEFAULT_ROWS   32  /* default tile rows (512 tiles = 8KB NES CHR) */
+
+/* ── Palette capacity ─────────────────────────────────────────────
+   CHR editor exposes PAL_COUNT slots. Slots 0-3 are BG / 4-7 SPR
+   (the NES hardware constraint used by compose mode).  Slots 8+ are
+   an "extended library" usable only in the CHR editor — compose mode
+   can't directly reference them, but the user can copy any library
+   palette's four colours into an active compose slot (0-7).        */
+#define PAL_COUNT   32
+#define PAL_VISIBLE  8         /* rows shown at once in the panel */
 
 /* ── Data types ───────────────────────────────────────────────── */
 
@@ -32,7 +41,7 @@ typedef struct { uint8_t idx[4]; } SubPalette;
 
 /* All palette editor state — separate from CHR pixel data. */
 typedef struct {
-    SubPalette sub[8];               /* [0-3] background, [4-7] sprite  */
+    SubPalette sub[PAL_COUNT];       /* [0-3] BG, [4-7] SPR, [8+] extended library */
     uint8_t    tile_pal[CHR_MAX_TILES]; /* sub-palette index per tile   */
 } PaletteState;
 
@@ -50,8 +59,9 @@ void chr_fill_debug(ChrPage *c);
 int  chr_load(ChrPage *c, const char *path);
 
 /* Save/load editor palette state to/from a binary .pal sidecar file.
-   Format: 4-byte magic "NPAL", 8×SubPalette (32 bytes),
-   tile_pal[CHR_MAX_TILES] (1024 bytes) — total 1060 bytes.
-   Returns 0 on success, -1 on error. */
+   Format v2: magic "NPL2" (4B) + count (1B) + reserved (1B) +
+              count × SubPalette (4B each) + tile_pal[CHR_MAX_TILES] (1024B).
+   Legacy v1 "NPAL" files (8 sub-palettes) are still accepted on load;
+   remaining slots are zero-filled.                                  */
 int  palette_save(const PaletteState *p, const char *path);
 int  palette_load(PaletteState *p, const char *path);
