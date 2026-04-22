@@ -21,3 +21,10 @@ void font_draw_char(SDL_Renderer *ren, char c, int x, int y, SDL_Color col);
 /* Draw a NUL-terminated string.  '\n' advances to the next line.
    Lowercase characters are shown as uppercase.                    */
 void font_draw_str(SDL_Renderer *ren, const char *s, int x, int y, SDL_Color col);
+
+/* Same as font_draw_str but with an explicit pixel scale (1 = tiny 5×7).
+   font_char_w_s/font_line_h_s return metrics at the given scale.       */
+int  font_char_w_s(int scale);
+int  font_line_h_s(int scale);
+void font_draw_str_s(SDL_Renderer *ren, const char *s, int x, int y,
+                     SDL_Color col, int scale);

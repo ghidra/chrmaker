@@ -111,3 +111,36 @@ void font_draw_str(SDL_Renderer *ren, const char *s, int x, int y, SDL_Color col
         }
     }
 }
+
+int font_char_w_s(int scale) { return (FONT_W + 1) * scale; }
+int font_line_h_s(int scale) { return (FONT_H + 2) * scale; }
+
+static void font_draw_char_s(SDL_Renderer *ren, char c, int x, int y,
+                             SDL_Color col, int scale) {
+    if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+    if (c < 0x20 || c > 0x5F) c = '?';
+    const uint8_t *g = FONT[(uint8_t)c - 0x20];
+    SDL_SetRenderDrawColor(ren, col.r, col.g, col.b, col.a);
+    for (int row = 0; row < FONT_H; row++) {
+        for (int px = 0; px < FONT_W; px++) {
+            if (g[row] & (0x10 >> px)) {
+                SDL_Rect r = { x + px * scale, y + row * scale, scale, scale };
+                SDL_RenderFillRect(ren, &r);
+            }
+        }
+    }
+}
+
+void font_draw_str_s(SDL_Renderer *ren, const char *s, int x, int y,
+                     SDL_Color col, int scale) {
+    int cx = x;
+    for (; *s; s++) {
+        if (*s == '\n') {
+            cx  = x;
+            y  += font_line_h_s(scale);
+        } else {
+            font_draw_char_s(ren, *s, cx, y, col, scale);
+            cx += font_char_w_s(scale);
+        }
+    }
+}

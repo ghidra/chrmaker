@@ -98,7 +98,15 @@ void render_destroy(void) {
     if (compose_tex) { SDL_DestroyTexture(compose_tex); compose_tex = NULL; }
 }
 
-/* ── Colour lookup ────────────────────────────────────────────── */
+/* ── Focus zoom / scrollbar helpers ───────────────────────────── */
+#define SB_THICKNESS 8
+#define SB_MIN_THUMB 12
+
+static inline int fz_scale_r(const EditorState *s) {
+    return s->zoom * s->focus_zoom;
+}
+
+/* Colour lookup — below. */
 static SDL_Color get_display_color(const EditorState *s, int tile, int val) {
     if (s->view_mode == VIEW_GRAYSCALE)
         return GRAY_RAMP[val & 3];
@@ -196,12 +204,15 @@ static void render_tile_grid(SDL_Renderer *ren, const EditorState *s) {
     SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
     SDL_SetRenderDrawColor(ren, 60, 100, 200, 130);
 
+    int scale = fz_scale_r(s);
     for (int i = 1; i < s->chr_cols; i++) {
-        int x = i * TILE_W * s->zoom;
+        int x = (i * TILE_W - s->pan_x) * scale;
+        if (x < 0 || x >= s->canvas_w) continue;
         SDL_RenderDrawLine(ren, x, 0, x, s->canvas_h - 1);
     }
     for (int i = 1; i < s->chr_rows; i++) {
-        int y = i * TILE_H * s->zoom;
+        int y = (i * TILE_H - s->pan_y) * scale;
+        if (y < 0 || y >= s->canvas_h) continue;
         SDL_RenderDrawLine(ren, 0, y, s->canvas_w - 1, y);
     }
 
@@ -212,15 +223,20 @@ static void render_pixel_grid(SDL_Renderer *ren, const EditorState *s) {
     SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
     SDL_SetRenderDrawColor(ren, 80, 80, 110, 55);
 
+    int scale    = fz_scale_r(s);
     int nes_cols = s->chr_cols * TILE_W;
     int nes_rows = s->chr_rows * TILE_H;
 
     for (int i = 1; i < nes_cols; i++) {
-        int x = i * s->zoom;
+        int x = (i - s->pan_x) * scale;
+        if (x < 0) continue;
+        if (x >= s->canvas_w) break;
         SDL_RenderDrawLine(ren, x, 0, x, s->canvas_h - 1);
     }
     for (int i = 1; i < nes_rows; i++) {
-        int y = i * s->zoom;
+        int y = (i - s->pan_y) * scale;
+        if (y < 0) continue;
+        if (y >= s->canvas_h) break;
         SDL_RenderDrawLine(ren, 0, y, s->canvas_w - 1, y);
     }
 
@@ -234,23 +250,28 @@ static void anim_frame_screen(const EditorState *s, int f,
                                int *out_sx, int *out_sy, int *out_base) {
     int stride = (s->sprite_mode == SPRITE_16 && s->chr_cols >= 2) ? 4 : 1;
     int base   = s->anim_first + f * stride;
+    int scale  = fz_scale_r(s);
+    int nx, ny;
     if (s->sprite_mode == SPRITE_16 && s->chr_cols >= 2) {
         int sprite_cols = s->chr_cols / 2;
         int S  = base / 4;
         int sx = S % sprite_cols;
         int sy = S / sprite_cols;
-        *out_sx = sx * 2 * TILE_W * s->zoom;
-        *out_sy = sy * 2 * TILE_H * s->zoom;
+        nx = sx * 2 * TILE_W;
+        ny = sy * 2 * TILE_H;
     } else {
-        *out_sx = (base % s->chr_cols) * TILE_W * s->zoom;
-        *out_sy = (base / s->chr_cols) * TILE_H * s->zoom;
+        nx = (base % s->chr_cols) * TILE_W;
+        ny = (base / s->chr_cols) * TILE_H;
     }
+    *out_sx = (nx - s->pan_x) * scale;
+    *out_sy = (ny - s->pan_y) * scale;
     *out_base = base;
 }
 
 /* Draw one ghost frame at screen position (sx, sy) with given alpha. */
 static void draw_ghost_tile(SDL_Renderer *ren, const EditorState *s,
                              int base_tile, int sx, int sy, Uint8 alpha) {
+    int scale = fz_scale_r(s);
     SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
     if (s->sprite_mode == SPRITE_16 && s->chr_cols >= 2) {
         for (int row = 0; row < TILE_H * 2; row++) {
@@ -261,8 +282,8 @@ static void draw_ghost_tile(SDL_Renderer *ren, const EditorState *s,
                 uint8_t val = s->chr.px[t][row % TILE_H][col % TILE_W] & 3;
                 SDL_Color c = get_display_color(s, t, val);
                 SDL_SetRenderDrawColor(ren, c.r, c.g, c.b, alpha);
-                SDL_Rect r = { sx + col * s->zoom, sy + row * s->zoom,
-                               s->zoom, s->zoom };
+                SDL_Rect r = { sx + col * scale, sy + row * scale,
+                               scale, scale };
                 SDL_RenderFillRect(ren, &r);
             }
         }
@@ -276,8 +297,8 @@ static void draw_ghost_tile(SDL_Renderer *ren, const EditorState *s,
                 uint8_t val = s->chr.px[base_tile][row][col] & 3;
                 SDL_Color c = get_display_color(s, base_tile, val);
                 SDL_SetRenderDrawColor(ren, c.r, c.g, c.b, alpha);
-                SDL_Rect r = { sx + col * s->zoom, sy + row * s->zoom,
-                               s->zoom, s->zoom };
+                SDL_Rect r = { sx + col * scale, sy + row * scale,
+                               scale, scale };
                 SDL_RenderFillRect(ren, &r);
             }
         }
@@ -289,11 +310,12 @@ static void draw_ghost_tile(SDL_Renderer *ren, const EditorState *s,
 static void render_tile_highlight(SDL_Renderer *ren, const EditorState *s) {
     if (!s->tile_mode) return;
 
-    int mult = (s->sprite_mode == SPRITE_16 && s->chr_cols >= 2) ? 2 : 1;
-    int tx = s->sel_tile_x * TILE_W * s->zoom;
-    int ty = s->sel_tile_y * TILE_H * s->zoom;
-    int tw = TILE_W * mult * s->zoom;
-    int th = TILE_H * mult * s->zoom;
+    int mult  = (s->sprite_mode == SPRITE_16 && s->chr_cols >= 2) ? 2 : 1;
+    int scale = fz_scale_r(s);
+    int tx = (s->sel_tile_x * TILE_W - s->pan_x) * scale;
+    int ty = (s->sel_tile_y * TILE_H - s->pan_y) * scale;
+    int tw = TILE_W * mult * scale;
+    int th = TILE_H * mult * scale;
 
     SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
     SDL_SetRenderDrawColor(ren, 0, 0, 0, 180);
@@ -313,9 +335,10 @@ static void render_anim_frame_highlight(SDL_Renderer *ren, const EditorState *s)
     int sx, sy, base;
     anim_frame_screen(s, s->anim_cur, &sx, &sy, &base);
 
-    int mult = (s->sprite_mode == SPRITE_16 && s->chr_cols >= 2) ? 2 : 1;
-    int tw   = TILE_W * mult * s->zoom;
-    int th   = TILE_H * mult * s->zoom;
+    int mult  = (s->sprite_mode == SPRITE_16 && s->chr_cols >= 2) ? 2 : 1;
+    int scale = fz_scale_r(s);
+    int tw    = TILE_W * mult * scale;
+    int th    = TILE_H * mult * scale;
 
     SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
     SDL_SetRenderDrawColor(ren, 0, 0, 0, 160);
@@ -349,8 +372,9 @@ static void render_anim_ghosts(SDL_Renderer *ren, const EditorState *s) {
 
 /* ── Screen-to-tile (for address display) ─────────────────────── */
 static int screen_to_tile_idx(const EditorState *s, int mx, int my) {
-    int nx = mx / s->zoom;
-    int ny = my / s->zoom;
+    int scale = fz_scale_r(s);
+    int nx = s->pan_x + mx / scale;
+    int ny = s->pan_y + my / scale;
     if (s->sprite_mode == SPRITE_16 && s->chr_cols >= 2) {
         int sprite_cols = s->chr_cols / 2;
         int sprite_x    = nx / (TILE_W * 2);
@@ -426,8 +450,11 @@ static void render_status(SDL_Renderer *ren, const EditorState *s) {
         int ty_ind = STATUS_Y + (STATUS_H - font_line_h()) / 2 + 1;
         int cw     = font_char_w();
 
-        char zbuf[4];
-        snprintf(zbuf, sizeof(zbuf), "%dX", s->zoom);
+        char zbuf[16];
+        if (s->focus_zoom > 1)
+            snprintf(zbuf, sizeof(zbuf), "%dX F%d", s->zoom, s->focus_zoom);
+        else
+            snprintf(zbuf, sizeof(zbuf), "%dX", s->zoom);
         int zx = s->win_w - (int)strlen(zbuf) * cw - 4;
         static const SDL_Color ZCOL = {140, 160, 200, 255};
         font_draw_str(ren, zbuf, zx, ty_ind, ZCOL);
@@ -646,7 +673,54 @@ static void render_tile_edit_panel(SDL_Renderer *ren, const EditorState *s) {
     if (s->wrap_mode == WRAP_H)    wlabel = "WRAP:H";
     if (s->wrap_mode == WRAP_V)    wlabel = "WRAP:V";
     if (s->wrap_mode == WRAP_BOTH) wlabel = "WRAP:HV";
-    font_draw_str(ren, wlabel, edit_x0, sw_y + sw_sz + 8, DIM);
+    int wrap_y = sw_y + sw_sz + 8;
+    font_draw_str(ren, wlabel, edit_x0, wrap_y, DIM);
+
+    /* 3×3 tiling preview — repeats the current tile to show edge-loop behaviour.
+       Fills full column width; each NES pixel is accumulated via integer math
+       so edges snap flush without rounding gaps. */
+    int mos_sz  = s->panel_w - 2 * PANEL_EDIT_MARGIN;
+    int mos_x0  = BX + PANEL_EDIT_MARGIN;
+    int mos_y0  = wrap_y + font_line_h() + 14;
+    int hint_y  = s->win_h - STATUS_H - font_line_h() - 4;
+    int N       = 3 * edit_dim;
+
+    if (mos_sz >= N && mos_y0 + mos_sz + 4 <= hint_y) {
+        font_draw_str(ren, "TILING", mos_x0, mos_y0 - font_line_h() - 2, DIM);
+
+        for (int gy = 0; gy < N; gy++) {
+            int y0 = mos_y0 + gy * mos_sz / N;
+            int y1 = mos_y0 + (gy + 1) * mos_sz / N;
+            int py = gy % edit_dim;
+            for (int gx = 0; gx < N; gx++) {
+                int x0 = mos_x0 + gx * mos_sz / N;
+                int x1 = mos_x0 + (gx + 1) * mos_sz / N;
+                int px = gx % edit_dim;
+
+                int tile, lr, lc;
+                if (s16) {
+                    int sub_x = px / TILE_W;
+                    int sub_y = py / TILE_H;
+                    int p = sub_x * 2 + sub_y;
+                    tile = base + p;
+                    lr = py % TILE_H;
+                    lc = px % TILE_W;
+                } else {
+                    tile = base;
+                    lr = py;
+                    lc = px;
+                }
+                uint8_t val = s->chr.px[tile][lr][lc] & 3;
+                SDL_Color c = get_display_color(s, tile, val);
+                fill(ren, x0, y0, x1 - x0, y1 - y0, c.r, c.g, c.b);
+            }
+        }
+
+        /* Border */
+        SDL_SetRenderDrawColor(ren, 120, 100, 30, 255);
+        SDL_Rect mb = { mos_x0 - 1, mos_y0 - 1, mos_sz + 2, mos_sz + 2 };
+        SDL_RenderDrawRect(ren, &mb);
+    }
 
     /* Hints */
     font_draw_str(ren, "ESC:BACK  W:WRAP", BX + PANEL_EDIT_MARGIN,
@@ -728,11 +802,14 @@ static void render_panel(SDL_Renderer *ren, const EditorState *s) {
         fill(ren, sx, PANEL_ACT_Y0, PANEL_ACT_SW, PANEL_ACT_SH,
              c.r, c.g, c.b);
 
-        /* Show hex value below swatch */
+        /* Show hex value below swatch, small font, centred. */
         char hex[5];
         snprintf(hex, sizeof(hex), "$%02X", idx_j);
         static const SDL_Color HEX_COL = {160, 160, 180, 255};
-        font_draw_str(ren, hex, sx, PANEL_ACT_Y0 + PANEL_ACT_SH + 2, HEX_COL);
+        int hex_w = (int)strlen(hex) * font_char_w_s(1);
+        int hex_x = sx + (PANEL_ACT_SW - hex_w) / 2;
+        font_draw_str_s(ren, hex, hex_x, PANEL_ACT_Y0 + PANEL_ACT_SH + 3,
+                        HEX_COL, 1);
     }
 
     hline(ren, BX + 2, PANEL_NES_Y0 - 4, s->panel_w - 4, 55, 55, 80);
@@ -848,6 +925,13 @@ static void render_help_overlay(SDL_Renderer *ren, const EditorState *s) {
     font_draw_str(ren, " CTRL+P      LOAD PALETTE",       x, y, WHT); y += lh;
     font_draw_str(ren, " DROP FILE   OPEN",               x, y, WHT); y += lh;
     font_draw_str(ren, " =/-         ZOOM IN/OUT",        x, y, WHT); y += lh + hg;
+
+    font_draw_str(ren, "FOCUS ZOOM (CANVAS-ONLY)",         x, y, CYN); y += lh;
+    font_draw_str(ren, " WHEEL ON CANVAS  ZOOM AT CURSOR", x, y, WHT); y += lh;
+    font_draw_str(ren, " MIDDLE DRAG     PAN CANVAS",      x, y, WHT); y += lh;
+    font_draw_str(ren, " SPACE + LMB     PAN CANVAS",      x, y, WHT); y += lh;
+    font_draw_str(ren, " SCROLLBARS      DRAG TO PAN",     x, y, WHT); y += lh;
+    font_draw_str(ren, " F               RESET FOCUS",     x, y, WHT); y += lh + hg;
 
     font_draw_str(ren, "COMPOSE MODE",                     x, y, CYN); y += lh;
     font_draw_str(ren, " TAB         COMPOSE MODE",       x, y, WHT); y += lh + hg;
@@ -1009,22 +1093,29 @@ static void render_compose_canvas(const EditorState *s) {
     SDL_UnlockTexture(compose_tex);
 }
 
+/* Effective compose scale (incl. focus zoom). */
+static inline int cmp_fzs(const EditorState *s) {
+    return s->compose_zoom * s->focus_zoom;
+}
+
 /* ── Compose: attribute grid overlay ─────────────────────────── */
 static void render_compose_attr_grid(SDL_Renderer *ren, const EditorState *s) {
     if (!s->compose_show_attr_grid) return;
 
-    int z = s->compose_zoom;
+    int z = cmp_fzs(s);
     SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
     SDL_SetRenderDrawColor(ren, 100, 60, 60, 80);
 
     /* Vertical lines every 16px (2 tiles) */
     for (int i = 1; i < 16; i++) {
-        int x = i * 16 * z;
+        int x = (i * 16 - s->pan_x) * z;
+        if (x < 0 || x >= s->compose_canvas_w) continue;
         SDL_RenderDrawLine(ren, x, 0, x, s->compose_canvas_h - 1);
     }
     /* Horizontal lines every 16px */
     for (int i = 1; i < 15; i++) {
-        int y = i * 16 * z;
+        int y = (i * 16 - s->pan_y) * z;
+        if (y < 0 || y >= s->compose_canvas_h) continue;
         SDL_RenderDrawLine(ren, 0, y, s->compose_canvas_w - 1, y);
     }
 
@@ -1037,7 +1128,9 @@ static void render_compose_hover(SDL_Renderer *ren, const EditorState *s) {
     int hy = s->compose_hover_y;
     if (hx < 0 || hy < 0) return;
 
-    int z = s->compose_zoom;
+    int z = cmp_fzs(s);
+    int ox = (hx * TILE_W - s->pan_x) * z;
+    int oy = (hy * TILE_H - s->pan_y) * z;
 
     if (s->compose_layer == COMPOSE_BG) {
         /* Translucent ghost of brush tile */
@@ -1049,8 +1142,7 @@ static void render_compose_hover(SDL_Renderer *ren, const EditorState *s) {
                 uint8_t val = s->chr.px[bt_idx][row][col] & 3;
                 SDL_Color c = compose_get_bg_color(s, s->active_sub_pal, val);
                 SDL_SetRenderDrawColor(ren, c.r, c.g, c.b, 120);
-                SDL_Rect r = { hx * TILE_W * z + col * z,
-                               hy * TILE_H * z + row * z, z, z };
+                SDL_Rect r = { ox + col * z, oy + row * z, z, z };
                 SDL_RenderFillRect(ren, &r);
             }
         }
@@ -1058,7 +1150,7 @@ static void render_compose_hover(SDL_Renderer *ren, const EditorState *s) {
 
         /* Border */
         SDL_SetRenderDrawColor(ren, 200, 200, 60, 255);
-        SDL_Rect border = { hx * TILE_W * z, hy * TILE_H * z, TILE_W * z, TILE_H * z };
+        SDL_Rect border = { ox, oy, TILE_W * z, TILE_H * z };
         SDL_RenderDrawRect(ren, &border);
     }
 }
@@ -1070,12 +1162,13 @@ static void render_compose_spr_highlight(SDL_Renderer *ren, const EditorState *s
     if (s->compose_spr_sel >= sc->sprite_count) return;
 
     const ComposeSprite *sp = &sc->sprites[s->compose_spr_sel];
-    int z = s->compose_zoom;
+    int z = cmp_fzs(s);
     int spr_w = sp->s16 ? 16 : 8;
     int spr_h = sp->s16 ? 16 : 8;
 
     SDL_SetRenderDrawColor(ren, 0, 220, 255, 255);
-    SDL_Rect border = { sp->x * z, sp->y * z, spr_w * z, spr_h * z };
+    SDL_Rect border = { (sp->x - s->pan_x) * z, (sp->y - s->pan_y) * z,
+                        spr_w * z, spr_h * z };
     SDL_RenderDrawRect(ren, &border);
 }
 
@@ -1280,9 +1373,12 @@ static void render_compose_status(SDL_Renderer *ren, const EditorState *s) {
         font_draw_str(ren, cbuf, lx + 8 * cw, ty, POS);
     }
 
-    /* Zoom — right-aligned */
-    char zbuf[4];
-    snprintf(zbuf, sizeof(zbuf), "%dX", s->compose_zoom);
+    /* Zoom — right-aligned (append focus zoom when >1) */
+    char zbuf[16];
+    if (s->focus_zoom > 1)
+        snprintf(zbuf, sizeof(zbuf), "%dX F%d", s->compose_zoom, s->focus_zoom);
+    else
+        snprintf(zbuf, sizeof(zbuf), "%dX", s->compose_zoom);
     int zx = s->win_w - (int)strlen(zbuf) * cw - 4;
     static const SDL_Color ZCOL = {140, 160, 200, 255};
     font_draw_str(ren, zbuf, zx, ty, ZCOL);
@@ -1354,9 +1450,216 @@ static void render_compose_help(SDL_Renderer *ren, const EditorState *s) {
     font_draw_str(ren, " CTRL+N  ADD NEW SCENE",          x, y, WHT); y += lh;
     font_draw_str(ren, " CTRL+S  SAVE SCENE FILE",        x, y, WHT); y += lh + hg;
 
+    font_draw_str(ren, "FOCUS ZOOM (CANVAS-ONLY)",        x, y, CYN); y += lh;
+    font_draw_str(ren, " WHEEL ON CANVAS  FOCUS ZOOM",    x, y, WHT); y += lh;
+    font_draw_str(ren, " MIDDLE DRAG     PAN",            x, y, WHT); y += lh;
+    font_draw_str(ren, " SPACE+LMB DRAG  PAN",            x, y, WHT); y += lh;
+    font_draw_str(ren, " SCROLLBARS      CLICK/DRAG",     x, y, WHT); y += lh;
+    font_draw_str(ren, " 0               RESET TO FILL",  x, y, WHT); y += lh + hg;
+
     font_draw_str(ren, " TAB/ESC EXIT COMPOSE",           x, y, DIM); y += lh;
     font_draw_str(ren, " SCROLL  PAGE UP/DOWN",            x, y, DIM); y += lh;
     font_draw_str(ren, " F1 OR ? TOGGLE HELP",            x, y, DIM);
+
+    SDL_RenderSetClipRect(ren, NULL);
+}
+
+/* ── Scrollbar rendering (focus-zoom overlays) ────────────────── */
+static bool sb_h_geom_r(const EditorState *s, int *track_x, int *track_w,
+                        int *thumb_x, int *thumb_w) {
+    if (s->focus_zoom <= 1) return false;
+    int scale = fz_scale_r(s);
+    int content_px = s->chr_cols * TILE_W * scale;
+    int visible_px = s->canvas_w;
+    if (content_px <= visible_px) return false;
+    *track_x = 0;
+    *track_w = s->canvas_w - SB_THICKNESS;
+    if (*track_w < SB_MIN_THUMB) *track_w = SB_MIN_THUMB;
+    int tw = (int)((long long)(*track_w) * visible_px / content_px);
+    if (tw < SB_MIN_THUMB) tw = SB_MIN_THUMB;
+    if (tw > *track_w)     tw = *track_w;
+    int max_pan_nes = s->chr_cols * TILE_W - s->canvas_w / scale;
+    int off = (max_pan_nes > 0)
+        ? (int)((long long)s->pan_x * (*track_w - tw) / max_pan_nes) : 0;
+    *thumb_x = *track_x + off;
+    *thumb_w = tw;
+    return true;
+}
+
+static bool sb_v_geom_r(const EditorState *s, int *track_y, int *track_h,
+                        int *thumb_y, int *thumb_h) {
+    if (s->focus_zoom <= 1) return false;
+    int scale = fz_scale_r(s);
+    int content_px = s->chr_rows * TILE_H * scale;
+    int visible_px = s->canvas_h;
+    if (content_px <= visible_px) return false;
+    *track_y = 0;
+    *track_h = s->canvas_h - SB_THICKNESS;
+    if (*track_h < SB_MIN_THUMB) *track_h = SB_MIN_THUMB;
+    int th = (int)((long long)(*track_h) * visible_px / content_px);
+    if (th < SB_MIN_THUMB) th = SB_MIN_THUMB;
+    if (th > *track_h)     th = *track_h;
+    int max_pan_nes = s->chr_rows * TILE_H - s->canvas_h / scale;
+    int off = (max_pan_nes > 0)
+        ? (int)((long long)s->pan_y * (*track_h - th) / max_pan_nes) : 0;
+    *thumb_y = *track_y + off;
+    *thumb_h = th;
+    return true;
+}
+
+static void render_scrollbars(SDL_Renderer *ren, const EditorState *s) {
+    if (s->focus_zoom <= 1) return;
+
+    int tx, tw, thx, thw;
+    int ty, th, thy, thh;
+    bool have_h = sb_h_geom_r(s, &tx, &tw, &thx, &thw);
+    bool have_v = sb_v_geom_r(s, &ty, &th, &thy, &thh);
+
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+
+    if (have_h) {
+        /* Track at bottom strip */
+        SDL_Rect track = { 0, s->canvas_h - SB_THICKNESS,
+                           s->canvas_w - SB_THICKNESS, SB_THICKNESS };
+        SDL_SetRenderDrawColor(ren, 30, 30, 40, 200);
+        SDL_RenderFillRect(ren, &track);
+        /* Thumb */
+        SDL_Rect thumb = { thx, s->canvas_h - SB_THICKNESS + 1, thw, SB_THICKNESS - 2 };
+        SDL_SetRenderDrawColor(ren, 160, 170, 200, 230);
+        SDL_RenderFillRect(ren, &thumb);
+    }
+    if (have_v) {
+        SDL_Rect track = { s->canvas_w - SB_THICKNESS, 0,
+                           SB_THICKNESS, s->canvas_h - SB_THICKNESS };
+        SDL_SetRenderDrawColor(ren, 30, 30, 40, 200);
+        SDL_RenderFillRect(ren, &track);
+        SDL_Rect thumb = { s->canvas_w - SB_THICKNESS + 1, thy, SB_THICKNESS - 2, thh };
+        SDL_SetRenderDrawColor(ren, 160, 170, 200, 230);
+        SDL_RenderFillRect(ren, &thumb);
+    }
+    /* Corner when both visible */
+    if (have_h && have_v) {
+        SDL_Rect corner = { s->canvas_w - SB_THICKNESS, s->canvas_h - SB_THICKNESS,
+                            SB_THICKNESS, SB_THICKNESS };
+        SDL_SetRenderDrawColor(ren, 30, 30, 40, 200);
+        SDL_RenderFillRect(ren, &corner);
+    }
+
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+}
+
+/* ── Compose scrollbars ───────────────────────────────────────── */
+static bool cmp_sb_h_geom_r(const EditorState *s, int *track_x, int *track_w,
+                            int *thumb_x, int *thumb_w) {
+    if (s->focus_zoom <= 1) return false;
+    int scale = cmp_fzs(s);
+    int content_px = 256 * scale;
+    int visible_px = s->compose_canvas_w;
+    if (content_px <= visible_px) return false;
+    *track_x = 0;
+    *track_w = s->compose_canvas_w - SB_THICKNESS;
+    if (*track_w < SB_MIN_THUMB) *track_w = SB_MIN_THUMB;
+    int tw = (int)((long long)(*track_w) * visible_px / content_px);
+    if (tw < SB_MIN_THUMB) tw = SB_MIN_THUMB;
+    if (tw > *track_w)     tw = *track_w;
+    int max_pan_nes = 256 - s->compose_canvas_w / scale;
+    int off = (max_pan_nes > 0)
+        ? (int)((long long)s->pan_x * (*track_w - tw) / max_pan_nes) : 0;
+    *thumb_x = *track_x + off;
+    *thumb_w = tw;
+    return true;
+}
+
+static bool cmp_sb_v_geom_r(const EditorState *s, int *track_y, int *track_h,
+                            int *thumb_y, int *thumb_h) {
+    if (s->focus_zoom <= 1) return false;
+    int scale = cmp_fzs(s);
+    int content_px = 240 * scale;
+    int visible_px = s->compose_canvas_h;
+    if (content_px <= visible_px) return false;
+    *track_y = 0;
+    *track_h = s->compose_canvas_h - SB_THICKNESS;
+    if (*track_h < SB_MIN_THUMB) *track_h = SB_MIN_THUMB;
+    int th = (int)((long long)(*track_h) * visible_px / content_px);
+    if (th < SB_MIN_THUMB) th = SB_MIN_THUMB;
+    if (th > *track_h)     th = *track_h;
+    int max_pan_nes = 240 - s->compose_canvas_h / scale;
+    int off = (max_pan_nes > 0)
+        ? (int)((long long)s->pan_y * (*track_h - th) / max_pan_nes) : 0;
+    *thumb_y = *track_y + off;
+    *thumb_h = th;
+    return true;
+}
+
+static void render_compose_scrollbars(SDL_Renderer *ren, const EditorState *s) {
+    if (s->focus_zoom <= 1) return;
+
+    int tx, tw, thx, thw;
+    int ty, th, thy, thh;
+    bool have_h = cmp_sb_h_geom_r(s, &tx, &tw, &thx, &thw);
+    bool have_v = cmp_sb_v_geom_r(s, &ty, &th, &thy, &thh);
+
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+
+    if (have_h) {
+        SDL_Rect track = { 0, s->compose_canvas_h - SB_THICKNESS,
+                           s->compose_canvas_w - SB_THICKNESS, SB_THICKNESS };
+        SDL_SetRenderDrawColor(ren, 30, 30, 40, 200);
+        SDL_RenderFillRect(ren, &track);
+        SDL_Rect thumb = { thx, s->compose_canvas_h - SB_THICKNESS + 1,
+                           thw, SB_THICKNESS - 2 };
+        SDL_SetRenderDrawColor(ren, 160, 170, 200, 230);
+        SDL_RenderFillRect(ren, &thumb);
+    }
+    if (have_v) {
+        SDL_Rect track = { s->compose_canvas_w - SB_THICKNESS, 0,
+                           SB_THICKNESS, s->compose_canvas_h - SB_THICKNESS };
+        SDL_SetRenderDrawColor(ren, 30, 30, 40, 200);
+        SDL_RenderFillRect(ren, &track);
+        SDL_Rect thumb = { s->compose_canvas_w - SB_THICKNESS + 1, thy,
+                           SB_THICKNESS - 2, thh };
+        SDL_SetRenderDrawColor(ren, 160, 170, 200, 230);
+        SDL_RenderFillRect(ren, &thumb);
+    }
+    if (have_h && have_v) {
+        SDL_Rect corner = { s->compose_canvas_w - SB_THICKNESS,
+                            s->compose_canvas_h - SB_THICKNESS,
+                            SB_THICKNESS, SB_THICKNESS };
+        SDL_SetRenderDrawColor(ren, 30, 30, 40, 200);
+        SDL_RenderFillRect(ren, &corner);
+    }
+
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+}
+
+/* ── Compose preview dock (paint mode) ────────────────────────── */
+static void render_preview(SDL_Renderer *ren, const EditorState *s) {
+    if (!s->show_preview || !compose_tex) return;
+
+    int x0 = s->preview_x0;
+    int y0 = 0;
+    int pw = s->preview_w;
+    int ph = s->preview_h;
+    int z  = s->preview_zoom;
+
+    /* Background + vertical separator on the left edge. */
+    fill(ren, x0, y0, pw, ph, 18, 18, 30);
+    vline(ren, x0, y0, ph, 55, 55, 80);
+
+    /* Keep compose_tex fresh — CHR pixels may have changed this frame. */
+    render_compose_canvas(s);
+
+    /* Source sub-rect (NES-px). Clamp to 256×240. */
+    int sw = pw / z; if (sw > 256 - s->preview_pan_x) sw = 256 - s->preview_pan_x;
+    int sh = ph / z; if (sh > 240 - s->preview_pan_y) sh = 240 - s->preview_pan_y;
+    if (sw <= 0 || sh <= 0) return;
+
+    SDL_Rect clip = { x0, y0, pw, ph };
+    SDL_RenderSetClipRect(ren, &clip);
+
+    SDL_Rect src = { s->preview_pan_x, s->preview_pan_y, sw, sh };
+    SDL_Rect dst = { x0, y0, sw * z, sh * z };
+    SDL_RenderCopy(ren, compose_tex, &src, &dst);
 
     SDL_RenderSetClipRect(ren, NULL);
 }
@@ -1368,12 +1671,27 @@ void render_frame(SDL_Renderer *ren, const EditorState *s) {
 
     if (s->compose_mode) {
         render_compose_canvas(s);
-        SDL_Rect dst = {0, 0, s->compose_canvas_w, s->compose_canvas_h};
-        SDL_RenderCopy(ren, compose_tex, NULL, &dst);
+
+        /* Clip so focus-zoomed content doesn't bleed into the side panel.
+           Scrollbars draw on top after clip reset. */
+        SDL_Rect cmp_clip = {0, 0, s->compose_canvas_w, s->compose_canvas_h};
+        SDL_RenderSetClipRect(ren, &cmp_clip);
+
+        int czs = cmp_fzs(s);
+        int csrc_w = (s->compose_canvas_w + czs - 1) / czs;
+        int csrc_h = (s->compose_canvas_h + czs - 1) / czs;
+        if (csrc_w + s->pan_x > 256) csrc_w = 256 - s->pan_x;
+        if (csrc_h + s->pan_y > 240) csrc_h = 240 - s->pan_y;
+        SDL_Rect csrc = { s->pan_x, s->pan_y, csrc_w, csrc_h };
+        SDL_Rect cdst = { 0, 0, csrc_w * czs, csrc_h * czs };
+        SDL_RenderCopy(ren, compose_tex, &csrc, &cdst);
 
         render_compose_attr_grid(ren, s);
         render_compose_hover(ren, s);
         render_compose_spr_highlight(ren, s);
+
+        SDL_RenderSetClipRect(ren, NULL);
+        render_compose_scrollbars(ren, s);
         render_compose_panel(ren, s);
         render_compose_status(ren, s);
         render_compose_help(ren, s);
@@ -1382,8 +1700,24 @@ void render_frame(SDL_Renderer *ren, const EditorState *s) {
     }
 
     render_canvas(s);
-    SDL_Rect canvas_dst = {0, 0, s->canvas_w, s->canvas_h};
-    SDL_RenderCopy(ren, canvas_tex, NULL, &canvas_dst);
+
+    /* Clip canvas-space drawing so focus-zoomed content doesn't bleed
+       into the palette panel. Scrollbars draw on top after clip reset. */
+    SDL_Rect canvas_clip = {0, 0, s->canvas_w, s->canvas_h};
+    SDL_RenderSetClipRect(ren, &canvas_clip);
+
+    int fzs = fz_scale_r(s);
+    /* Source rect on the NES-resolution texture. Use ceil so the right/
+       bottom edges draw to the clip boundary even at non-integer fits. */
+    int src_w = (s->canvas_w + fzs - 1) / fzs;
+    int src_h = (s->canvas_h + fzs - 1) / fzs;
+    if (src_w + s->pan_x > s->chr_cols * TILE_W)
+        src_w = s->chr_cols * TILE_W - s->pan_x;
+    if (src_h + s->pan_y > s->chr_rows * TILE_H)
+        src_h = s->chr_rows * TILE_H - s->pan_y;
+    SDL_Rect canvas_src = { s->pan_x, s->pan_y, src_w, src_h };
+    SDL_Rect canvas_dst = { 0, 0, src_w * fzs, src_h * fzs };
+    SDL_RenderCopy(ren, canvas_tex, &canvas_src, &canvas_dst);
 
     if (s->show_pixel_grid) render_pixel_grid(ren, s);
     if (s->show_tile_grid)  render_tile_grid(ren, s);
@@ -1391,11 +1725,16 @@ void render_frame(SDL_Renderer *ren, const EditorState *s) {
     render_tile_highlight(ren, s);
     render_anim_frame_highlight(ren, s);
     render_anim_ghosts(ren, s);
+
+    SDL_RenderSetClipRect(ren, NULL);
+    render_scrollbars(ren, s);
     if (s->tile_edit)
         render_tile_edit_panel(ren, s);
     else
         render_panel(ren, s);
     render_status(ren, s);
+
+    render_preview(ren, s);
 
     vline(ren, s->canvas_w, 0,                   s->win_h - STATUS_H, 55, 55, 80);
     hline(ren, 0,           s->win_h - STATUS_H, s->win_w,            55, 55, 80);

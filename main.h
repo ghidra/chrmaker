@@ -75,6 +75,21 @@ typedef struct {
     bool         drag_in_edit_panel;   /* drag started in tile-edit panel     */
     int          mouse_x, mouse_y;   /* current screen cursor position */
 
+    /* Focus zoom (zoom into canvas without resizing window).
+       Effective screen-px per NES-px = zoom * focus_zoom.
+       pan_x/pan_y are the top-left NES-pixel offset visible in the viewport. */
+    int          focus_zoom;         /* 1..32, 1 = fill (no focus)           */
+    int          pan_x, pan_y;       /* NES-pixel offset of viewport origin  */
+    bool         space_held;
+    bool         panning;            /* middle-drag OR space+LMB in progress */
+    int          pan_anchor_mx;      /* screen x where pan started           */
+    int          pan_anchor_my;
+    int          pan_anchor_px;      /* pan_x at start of pan                */
+    int          pan_anchor_py;
+    int          sb_drag;            /* 0 none, 1 horiz, 2 vert              */
+    int          sb_drag_anchor;     /* mouse screen coord at drag start     */
+    int          sb_drag_pan_start;  /* pan_x or pan_y at drag start         */
+
     /* File operations */
     char         current_path[256]; /* active CHR file path for save/load  */
     bool         want_save;         /* save CHR to current_path            */
@@ -132,6 +147,18 @@ typedef struct {
     bool         want_save_scene;
     bool         want_load_scene;
     char         scene_path[256];
+
+    /* Compose preview dock (in paint mode) — shows active compose scene */
+    bool         show_preview;
+    int          preview_zoom;       /* 1..4                                 */
+    int          preview_pan_x;      /* NES-px offset into scene (0..256-vw) */
+    int          preview_pan_y;      /* NES-px offset into scene (0..240-vh) */
+    int          preview_w;          /* column width  (screen px)            */
+    int          preview_h;          /* column height (screen px)            */
+    int          preview_x0;         /* column left edge (screen px)         */
+    bool         preview_panning;
+    int          preview_pan_anchor_mx, preview_pan_anchor_my;
+    int          preview_pan_anchor_px, preview_pan_anchor_py;
 
     /* Loop control */
     bool         running;

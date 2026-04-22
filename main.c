@@ -100,6 +100,27 @@ static void state_update_dims(EditorState *s) {
     s->win_w = s->canvas_w + s->panel_w;
     s->win_h = (s->canvas_h < panel_full_h ? panel_full_h : s->canvas_h)
                + STATUS_H;
+
+    /* Compose preview dock (right of the palette panel). */
+    if (s->show_preview) {
+        s->preview_w  = 256;
+        s->preview_x0 = s->canvas_w + s->panel_w;
+        s->preview_h  = s->win_h - STATUS_H;
+        s->win_w     += s->preview_w;
+
+        /* Clamp pan so viewport stays inside the 256×240 scene. */
+        int z   = s->preview_zoom;
+        int vw  = s->preview_w / z; if (vw > 256) vw = 256;
+        int vh  = s->preview_h / z; if (vh > 240) vh = 240;
+        int mx  = 256 - vw; if (mx < 0) mx = 0;
+        int my  = 240 - vh; if (my < 0) my = 0;
+        if (s->preview_pan_x < 0)  s->preview_pan_x = 0;
+        if (s->preview_pan_y < 0)  s->preview_pan_y = 0;
+        if (s->preview_pan_x > mx) s->preview_pan_x = mx;
+        if (s->preview_pan_y > my) s->preview_pan_y = my;
+    } else {
+        s->preview_w = s->preview_h = s->preview_x0 = 0;
+    }
 }
 
 /* ── State init ───────────────────────────────────────────────── */
@@ -111,8 +132,14 @@ static void state_init(EditorState *s, const char *path, int cols, int rows) {
 
     s->chr_cols        = cols;
     s->chr_rows        = rows;
-    s->zoom            = 3;
+    s->zoom            = 4;
     s->anim_preview_zoom = 1;   /* must be set before state_update_dims */
+    s->focus_zoom      = 1;
+    s->pan_x           = 0;
+    s->pan_y           = 0;
+    s->space_held      = false;
+    s->panning         = false;
+    s->sb_drag         = 0;
     state_update_dims(s);
     s->want_resize     = false;
 
@@ -158,7 +185,7 @@ static void state_init(EditorState *s, const char *path, int cols, int rows) {
     s->brush_hflip        = false;
     s->brush_vflip        = false;
     s->brush_s16          = false;
-    s->compose_zoom       = 2;
+    s->compose_zoom       = 4;
     s->compose_hover_x    = -1;
     s->compose_hover_y    = -1;
     s->compose_spr_sel    = -1;
@@ -168,6 +195,13 @@ static void state_init(EditorState *s, const char *path, int cols, int rows) {
     s->want_save_scene    = false;
     s->want_load_scene    = false;
     s->scene_path[0]      = '\0';
+
+    /* Compose preview dock */
+    s->show_preview   = false;
+    s->preview_zoom   = 1;
+    s->preview_pan_x  = 0;
+    s->preview_pan_y  = 0;
+    s->preview_panning = false;
 
     snprintf(s->current_path, sizeof(s->current_path), "%s", path);
 }
@@ -365,6 +399,10 @@ int main(int argc, char *argv[]) {
         /* ── Resize — MUST come after want_load, before render_frame ── */
         if (state.want_resize) {
             state.want_resize = false;
+            /* Reset focus zoom/pan: canvas dims just changed. */
+            state.focus_zoom = 1;
+            state.pan_x = 0;
+            state.pan_y = 0;
             state_update_dims(&state);
             SDL_SetWindowSize(win, state.win_w, state.win_h);
             SDL_SetWindowPosition(win, SDL_WINDOWPOS_CENTERED,

@@ -183,12 +183,105 @@ static void anim_finish_pick(EditorState *s) {
     s->anim_state       = ANIM_ACTIVE;
 }
 
+/* ── Focus zoom / pan helpers ─────────────────────────────────── */
+
+#define SB_THICKNESS 8
+#define SB_MIN_THUMB 12
+#define FOCUS_ZOOM_MAX 32
+
+static inline int fz_scale(const EditorState *s) {
+    return s->zoom * s->focus_zoom;
+}
+
+static void clamp_pan(EditorState *s) {
+    if (s->focus_zoom <= 1) { s->pan_x = 0; s->pan_y = 0; return; }
+    int scale = fz_scale(s);
+    int content_w = s->chr_cols * TILE_W;
+    int content_h = s->chr_rows * TILE_H;
+    int vis_w = s->canvas_w / scale;
+    int vis_h = s->canvas_h / scale;
+    int max_x = content_w - vis_w; if (max_x < 0) max_x = 0;
+    int max_y = content_h - vis_h; if (max_y < 0) max_y = 0;
+    if (s->pan_x < 0) s->pan_x = 0;
+    if (s->pan_y < 0) s->pan_y = 0;
+    if (s->pan_x > max_x) s->pan_x = max_x;
+    if (s->pan_y > max_y) s->pan_y = max_y;
+}
+
+/* Convert canvas screen coords to NES pixel coords (accounts for pan+focus). */
+static inline int sx_to_nx(const EditorState *s, int mx) {
+    return s->pan_x + mx / fz_scale(s);
+}
+static inline int sy_to_ny(const EditorState *s, int my) {
+    return s->pan_y + my / fz_scale(s);
+}
+
+/* Horizontal scrollbar geometry (in screen px, canvas-relative).
+   Returns false if scrollbar not visible. */
+static bool sb_h_geom(const EditorState *s, int *track_x, int *track_w,
+                      int *thumb_x, int *thumb_w) {
+    if (s->focus_zoom <= 1) return false;
+    int scale = fz_scale(s);
+    int content_px = s->chr_cols * TILE_W * scale;
+    int visible_px = s->canvas_w;
+    if (content_px <= visible_px) return false;
+    *track_x = 0;
+    *track_w = s->canvas_w - SB_THICKNESS;
+    if (*track_w < SB_MIN_THUMB) *track_w = SB_MIN_THUMB;
+    int tw = (int)((long long)(*track_w) * visible_px / content_px);
+    if (tw < SB_MIN_THUMB) tw = SB_MIN_THUMB;
+    if (tw > *track_w)     tw = *track_w;
+    int max_pan_nes = s->chr_cols * TILE_W - s->canvas_w / scale;
+    int off = (max_pan_nes > 0)
+        ? (int)((long long)s->pan_x * (*track_w - tw) / max_pan_nes) : 0;
+    *thumb_x = *track_x + off;
+    *thumb_w = tw;
+    return true;
+}
+
+static bool sb_v_geom(const EditorState *s, int *track_y, int *track_h,
+                      int *thumb_y, int *thumb_h) {
+    if (s->focus_zoom <= 1) return false;
+    int scale = fz_scale(s);
+    int content_px = s->chr_rows * TILE_H * scale;
+    int visible_px = s->canvas_h;
+    if (content_px <= visible_px) return false;
+    *track_y = 0;
+    *track_h = s->canvas_h - SB_THICKNESS;
+    if (*track_h < SB_MIN_THUMB) *track_h = SB_MIN_THUMB;
+    int th = (int)((long long)(*track_h) * visible_px / content_px);
+    if (th < SB_MIN_THUMB) th = SB_MIN_THUMB;
+    if (th > *track_h)     th = *track_h;
+    int max_pan_nes = s->chr_rows * TILE_H - s->canvas_h / scale;
+    int off = (max_pan_nes > 0)
+        ? (int)((long long)s->pan_y * (*track_h - th) / max_pan_nes) : 0;
+    *thumb_y = *track_y + off;
+    *thumb_h = th;
+    return true;
+}
+
+/* Zoom focus around a pixel-under-cursor. Keeps (mx,my) NES pixel stable. */
+static void focus_zoom_at(EditorState *s, int mx, int my, int new_focus) {
+    if (new_focus < 1) new_focus = 1;
+    if (new_focus > FOCUS_ZOOM_MAX) new_focus = FOCUS_ZOOM_MAX;
+    if (new_focus == s->focus_zoom) return;
+    /* NES pixel currently under cursor */
+    int nx = sx_to_nx(s, mx);
+    int ny = sy_to_ny(s, my);
+    s->focus_zoom = new_focus;
+    /* After zoom change: pan so the same NES pixel lands under cursor again */
+    int scale = fz_scale(s);
+    s->pan_x = nx - mx / scale;
+    s->pan_y = ny - my / scale;
+    clamp_pan(s);
+}
+
 /* Map screen coords to the tile index under the cursor.
    In sprite-16 mode the tile layout is remapped, so screen position
    does not equal (row*cols + col) — we compute the correct sub-tile. */
 static int screen_to_tile(const EditorState *s, int mx, int my) {
-    int nx = mx / s->zoom;
-    int ny = my / s->zoom;
+    int nx = sx_to_nx(s, mx);
+    int ny = sy_to_ny(s, my);
     if (s->sprite_mode == SPRITE_16 && s->chr_cols >= 2) {
         int sprite_cols = s->chr_cols / 2;
         int sprite_x    = nx / (TILE_W * 2);
@@ -316,8 +409,8 @@ static void tile_edit_paint(EditorState *s, int px, int py) {
 static void paint_at(EditorState *s, int mx, int my) {
     if (mx < 0 || mx >= s->canvas_w || my < 0 || my >= s->canvas_h) return;
 
-    int px_x = mx / s->zoom;
-    int px_y = my / s->zoom;
+    int px_x = sx_to_nx(s, mx);
+    int px_y = sy_to_ny(s, my);
     int tile, local_x, local_y;
 
     if (s->tile_mode) {
@@ -365,13 +458,15 @@ static void paint_at(EditorState *s, int mx, int my) {
 static void select_tile_under_cursor(EditorState *s) {
     int mx = s->mouse_x, my = s->mouse_y;
     if (mx < 0 || mx >= s->canvas_w || my < 0 || my >= s->canvas_h) return;
+    int nx = sx_to_nx(s, mx);
+    int ny = sy_to_ny(s, my);
     if (s->sprite_mode == SPRITE_16 && s->chr_cols >= 2) {
         /* Snap to sprite (2-tile) boundary so sel_tile_x/y are always even. */
-        s->sel_tile_x = ((mx / s->zoom) / (TILE_W * 2)) * 2;
-        s->sel_tile_y = ((my / s->zoom) / (TILE_H * 2)) * 2;
+        s->sel_tile_x = (nx / (TILE_W * 2)) * 2;
+        s->sel_tile_y = (ny / (TILE_H * 2)) * 2;
     } else {
-        s->sel_tile_x = (mx / s->zoom) / TILE_W;
-        s->sel_tile_y = (my / s->zoom) / TILE_H;
+        s->sel_tile_x = nx / TILE_W;
+        s->sel_tile_y = ny / TILE_H;
     }
     s->tile_mode = true;
 }
@@ -464,6 +559,86 @@ static ComposeScene *active_scene(EditorState *s) {
     return &s->compose.scenes[s->compose.active_scene];
 }
 
+/* ── Compose mode: focus zoom / pan helpers ───────────────────── */
+static inline int cmp_fz_scale(const EditorState *s) {
+    return s->compose_zoom * s->focus_zoom;
+}
+
+static void cmp_clamp_pan(EditorState *s) {
+    if (s->focus_zoom <= 1) { s->pan_x = 0; s->pan_y = 0; return; }
+    int scale = cmp_fz_scale(s);
+    int vis_w = s->compose_canvas_w / scale;
+    int vis_h = s->compose_canvas_h / scale;
+    int max_x = 256 - vis_w; if (max_x < 0) max_x = 0;
+    int max_y = 240 - vis_h; if (max_y < 0) max_y = 0;
+    if (s->pan_x < 0) s->pan_x = 0;
+    if (s->pan_y < 0) s->pan_y = 0;
+    if (s->pan_x > max_x) s->pan_x = max_x;
+    if (s->pan_y > max_y) s->pan_y = max_y;
+}
+
+static inline int cmp_sx_to_nx(const EditorState *s, int mx) {
+    return s->pan_x + mx / cmp_fz_scale(s);
+}
+static inline int cmp_sy_to_ny(const EditorState *s, int my) {
+    return s->pan_y + my / cmp_fz_scale(s);
+}
+
+static bool cmp_sb_h_geom(const EditorState *s, int *track_x, int *track_w,
+                          int *thumb_x, int *thumb_w) {
+    if (s->focus_zoom <= 1) return false;
+    int scale = cmp_fz_scale(s);
+    int content_px = 256 * scale;
+    int visible_px = s->compose_canvas_w;
+    if (content_px <= visible_px) return false;
+    *track_x = 0;
+    *track_w = s->compose_canvas_w - SB_THICKNESS;
+    if (*track_w < SB_MIN_THUMB) *track_w = SB_MIN_THUMB;
+    int tw = (int)((long long)(*track_w) * visible_px / content_px);
+    if (tw < SB_MIN_THUMB) tw = SB_MIN_THUMB;
+    if (tw > *track_w)     tw = *track_w;
+    int max_pan_nes = 256 - s->compose_canvas_w / scale;
+    int off = (max_pan_nes > 0)
+        ? (int)((long long)s->pan_x * (*track_w - tw) / max_pan_nes) : 0;
+    *thumb_x = *track_x + off;
+    *thumb_w = tw;
+    return true;
+}
+
+static bool cmp_sb_v_geom(const EditorState *s, int *track_y, int *track_h,
+                          int *thumb_y, int *thumb_h) {
+    if (s->focus_zoom <= 1) return false;
+    int scale = cmp_fz_scale(s);
+    int content_px = 240 * scale;
+    int visible_px = s->compose_canvas_h;
+    if (content_px <= visible_px) return false;
+    *track_y = 0;
+    *track_h = s->compose_canvas_h - SB_THICKNESS;
+    if (*track_h < SB_MIN_THUMB) *track_h = SB_MIN_THUMB;
+    int th = (int)((long long)(*track_h) * visible_px / content_px);
+    if (th < SB_MIN_THUMB) th = SB_MIN_THUMB;
+    if (th > *track_h)     th = *track_h;
+    int max_pan_nes = 240 - s->compose_canvas_h / scale;
+    int off = (max_pan_nes > 0)
+        ? (int)((long long)s->pan_y * (*track_h - th) / max_pan_nes) : 0;
+    *thumb_y = *track_y + off;
+    *thumb_h = th;
+    return true;
+}
+
+static void cmp_focus_zoom_at(EditorState *s, int mx, int my, int new_focus) {
+    if (new_focus < 1) new_focus = 1;
+    if (new_focus > FOCUS_ZOOM_MAX) new_focus = FOCUS_ZOOM_MAX;
+    if (new_focus == s->focus_zoom) return;
+    int nx = cmp_sx_to_nx(s, mx);
+    int ny = cmp_sy_to_ny(s, my);
+    s->focus_zoom = new_focus;
+    int scale = cmp_fz_scale(s);
+    s->pan_x = nx - mx / scale;
+    s->pan_y = ny - my / scale;
+    cmp_clamp_pan(s);
+}
+
 /* ── Compose mode: panel click ───────────────────────────────── */
 static void compose_panel_click(EditorState *s, int px, int py) {
     /* Two-column layout: picker on left, controls on right.
@@ -536,8 +711,10 @@ static void compose_panel_click(EditorState *s, int px, int py) {
 
 /* ── Compose mode: canvas click ──────────────────────────────── */
 static void compose_canvas_click(EditorState *s, int mx, int my, bool left, bool shift) {
-    int tile_x = mx / (TILE_W * s->compose_zoom);
-    int tile_y = my / (TILE_H * s->compose_zoom);
+    int nx = cmp_sx_to_nx(s, mx);
+    int ny = cmp_sy_to_ny(s, my);
+    int tile_x = nx / TILE_W;
+    int tile_y = ny / TILE_H;
     if (tile_x < 0 || tile_x >= COMPOSE_NT_W || tile_y < 0 || tile_y >= COMPOSE_NT_H) return;
 
     ComposeScene *sc = active_scene(s);
@@ -566,8 +743,8 @@ static void compose_canvas_click(EditorState *s, int mx, int my, bool left, bool
         }
     } else {
         /* Sprite layer */
-        int px_x = mx / s->compose_zoom;
-        int px_y = my / s->compose_zoom;
+        int px_x = nx;
+        int px_y = ny;
 
         if (left) {
             /* Check if clicking on existing sprite */
@@ -636,11 +813,15 @@ static void compose_input(const SDL_Event *e, EditorState *s) {
                         s->compose_spr_sel = -1;
                     else {
                         s->compose_mode = false;
+                        s->focus_zoom   = 1;
+                        s->pan_x = s->pan_y = 0;
                         s->want_resize  = true;
                     }
                     break;
                 case SDLK_TAB:
                     s->compose_mode = false;
+                    s->focus_zoom   = 1;
+                    s->pan_x = s->pan_y = 0;
                     s->want_resize  = true;
                     break;
                 case SDLK_F1:
@@ -688,6 +869,15 @@ static void compose_input(const SDL_Event *e, EditorState *s) {
                     break;
                 case SDLK_MINUS:
                     if (s->compose_zoom > 1) { s->compose_zoom--; s->want_resize = true; }
+                    break;
+                case SDLK_SPACE:
+                    if (!e->key.repeat) s->space_held = true;
+                    break;
+                case SDLK_0:
+                    /* Reset focus zoom/pan. (F is vflip in sprite layer, so '0' here.) */
+                    s->focus_zoom = 1;
+                    s->pan_x = 0;
+                    s->pan_y = 0;
                     break;
                 case SDLK_PAGEUP:
                     if (s->compose.active_scene > 0) s->compose.active_scene--;
@@ -770,12 +960,66 @@ static void compose_input(const SDL_Event *e, EditorState *s) {
             }
             break;
 
+        case SDL_KEYUP:
+            if (e->key.keysym.sym == SDLK_SPACE) s->space_held = false;
+            break;
+
         case SDL_MOUSEBUTTONDOWN: {
             int mx = e->button.x, my = e->button.y;
             s->mouse_x = mx; s->mouse_y = my;
             bool left  = (e->button.button == SDL_BUTTON_LEFT);
             bool right = (e->button.button == SDL_BUTTON_RIGHT);
+            bool mid   = (e->button.button == SDL_BUTTON_MIDDLE);
             bool shift = (SDL_GetModState() & KMOD_SHIFT) != 0;
+
+            /* Middle button → pan canvas */
+            if (mid && mx < cw && my < ch) {
+                s->panning = true;
+                s->pan_anchor_mx = mx; s->pan_anchor_my = my;
+                s->pan_anchor_px = s->pan_x; s->pan_anchor_py = s->pan_y;
+                break;
+            }
+
+            if (left) {
+                /* Space + LMB → pan */
+                if (s->space_held && mx < cw && my < ch) {
+                    s->panning = true;
+                    s->pan_anchor_mx = mx; s->pan_anchor_my = my;
+                    s->pan_anchor_px = s->pan_x; s->pan_anchor_py = s->pan_y;
+                    break;
+                }
+                /* Scrollbar hit-test */
+                if (s->focus_zoom > 1 && mx < cw && my < ch) {
+                    int tx, tw, thx, thw;
+                    int ty, th, thy, thh;
+                    bool hh = cmp_sb_h_geom(s, &tx, &tw, &thx, &thw);
+                    bool vv = cmp_sb_v_geom(s, &ty, &th, &thy, &thh);
+                    if (hh && my >= ch - SB_THICKNESS && mx < cw - SB_THICKNESS) {
+                        if (!(mx >= thx && mx < thx + thw)) {
+                            int max_pan_nes = 256 - cw / cmp_fz_scale(s);
+                            if (tw > thw && max_pan_nes > 0)
+                                s->pan_x = (int)((long long)(mx - tx - thw/2) * max_pan_nes / (tw - thw));
+                            cmp_clamp_pan(s);
+                        }
+                        s->sb_drag = 1;
+                        s->sb_drag_anchor = mx;
+                        s->sb_drag_pan_start = s->pan_x;
+                        break;
+                    }
+                    if (vv && mx >= cw - SB_THICKNESS && my < ch - SB_THICKNESS) {
+                        if (!(my >= thy && my < thy + thh)) {
+                            int max_pan_nes = 240 - ch / cmp_fz_scale(s);
+                            if (th > thh && max_pan_nes > 0)
+                                s->pan_y = (int)((long long)(my - ty - thh/2) * max_pan_nes / (th - thh));
+                            cmp_clamp_pan(s);
+                        }
+                        s->sb_drag = 2;
+                        s->sb_drag_anchor = my;
+                        s->sb_drag_pan_start = s->pan_y;
+                        break;
+                    }
+                }
+            }
 
             if (left) s->mouse_down = true;
             if (right) s->right_mouse_down = true;
@@ -793,9 +1037,12 @@ static void compose_input(const SDL_Event *e, EditorState *s) {
         }
 
         case SDL_MOUSEBUTTONUP:
+            if (e->button.button == SDL_BUTTON_MIDDLE) s->panning = false;
             if (e->button.button == SDL_BUTTON_LEFT) {
                 s->mouse_down = false;
                 s->compose_spr_drag = -1;
+                s->panning = false;
+                s->sb_drag = 0;
             }
             if (e->button.button == SDL_BUTTON_RIGHT)
                 s->right_mouse_down = false;
@@ -805,10 +1052,44 @@ static void compose_input(const SDL_Event *e, EditorState *s) {
             int mx = e->motion.x, my = e->motion.y;
             s->mouse_x = mx; s->mouse_y = my;
 
-            /* Update hover position */
+            if (s->panning) {
+                int scale = cmp_fz_scale(s);
+                s->pan_x = s->pan_anchor_px - (mx - s->pan_anchor_mx) / scale;
+                s->pan_y = s->pan_anchor_py - (my - s->pan_anchor_my) / scale;
+                cmp_clamp_pan(s);
+                break;
+            }
+            if (s->sb_drag == 1) {
+                int tx, tw, thx, thw;
+                if (cmp_sb_h_geom(s, &tx, &tw, &thx, &thw)) {
+                    int max_pan_nes = 256 - cw / cmp_fz_scale(s);
+                    if (tw > thw && max_pan_nes > 0) {
+                        int d = mx - s->sb_drag_anchor;
+                        s->pan_x = s->sb_drag_pan_start
+                            + (int)((long long)d * max_pan_nes / (tw - thw));
+                        cmp_clamp_pan(s);
+                    }
+                }
+                break;
+            }
+            if (s->sb_drag == 2) {
+                int ty, th, thy, thh;
+                if (cmp_sb_v_geom(s, &ty, &th, &thy, &thh)) {
+                    int max_pan_nes = 240 - ch / cmp_fz_scale(s);
+                    if (th > thh && max_pan_nes > 0) {
+                        int d = my - s->sb_drag_anchor;
+                        s->pan_y = s->sb_drag_pan_start
+                            + (int)((long long)d * max_pan_nes / (th - thh));
+                        cmp_clamp_pan(s);
+                    }
+                }
+                break;
+            }
+
+            /* Update hover position (pan-aware) */
             if (mx < cw && my < ch) {
-                s->compose_hover_x = mx / (TILE_W * s->compose_zoom);
-                s->compose_hover_y = my / (TILE_H * s->compose_zoom);
+                s->compose_hover_x = cmp_sx_to_nx(s, mx) / TILE_W;
+                s->compose_hover_y = cmp_sy_to_ny(s, my) / TILE_H;
             } else {
                 s->compose_hover_x = -1;
                 s->compose_hover_y = -1;
@@ -816,8 +1097,8 @@ static void compose_input(const SDL_Event *e, EditorState *s) {
 
             /* Sprite dragging */
             if (s->compose_spr_drag >= 0 && s->mouse_down) {
-                int px_x = mx / s->compose_zoom - s->drag_off_x;
-                int px_y = my / s->compose_zoom - s->drag_off_y;
+                int px_x = cmp_sx_to_nx(s, mx) - s->drag_off_x;
+                int px_y = cmp_sy_to_ny(s, my) - s->drag_off_y;
                 if (px_x < 0)   px_x = 0;
                 if (px_x > 255) px_x = 255;
                 if (px_y < 0)   px_y = 0;
@@ -839,6 +1120,10 @@ static void compose_input(const SDL_Event *e, EditorState *s) {
             if (s->compose_show_help) {
                 s->help_scroll -= e->wheel.y * font_line_h() * 2;
                 if (s->help_scroll < 0) s->help_scroll = 0;
+            } else if (s->mouse_x < cw) {
+                /* Wheel over canvas → focus zoom at cursor */
+                cmp_focus_zoom_at(s, s->mouse_x, s->mouse_y,
+                                  s->focus_zoom + e->wheel.y);
             } else if (s->mouse_x >= cw) {
                 /* Wheel over compose panel → scroll the palette list. */
                 s->palette_scroll -= e->wheel.y;
@@ -1000,6 +1285,9 @@ void input_handle(const SDL_Event *e, EditorState *s) {
                         s->clipboard_s16  = s16;
                         s->has_clipboard  = true;
                         clipboard_save(s);
+                    } else if (!(e->key.keysym.mod & (KMOD_CTRL|KMOD_ALT|KMOD_GUI))) {
+                        s->show_preview = !s->show_preview;
+                        s->want_resize  = true;
                     }
                     break;
                 case SDLK_x:
@@ -1063,6 +1351,8 @@ void input_handle(const SDL_Event *e, EditorState *s) {
                     s->compose_mode = true;
                     s->tile_mode    = false;
                     s->tile_edit    = false;
+                    s->focus_zoom   = 1;
+                    s->pan_x = s->pan_y = 0;
                     s->want_resize  = true;
                     break;
 
@@ -1080,10 +1370,16 @@ void input_handle(const SDL_Event *e, EditorState *s) {
                     }
                     break;
                 case SDLK_SPACE:
-                    if (s->anim_state == ANIM_ACTIVE) {
+                    if (!e->key.repeat) s->space_held = true;
+                    if (s->anim_state == ANIM_ACTIVE && !e->key.repeat) {
                         s->anim_playing = !s->anim_playing;
                         s->anim_last_tick = SDL_GetTicks();
                     }
+                    break;
+                case SDLK_f:
+                    s->focus_zoom = 1;
+                    s->pan_x = 0;
+                    s->pan_y = 0;
                     break;
                 case SDLK_COMMA:
                     if (s->anim_state == ANIM_ACTIVE && s->anim_speed > 1)
@@ -1124,10 +1420,88 @@ void input_handle(const SDL_Event *e, EditorState *s) {
             }
             break;
 
+        case SDL_KEYUP:
+            if (e->key.keysym.sym == SDLK_SPACE) s->space_held = false;
+            break;
+
         case SDL_MOUSEBUTTONDOWN: {
             int mx = e->button.x, my = e->button.y;
             s->mouse_x = mx; s->mouse_y = my;
+
+            bool in_preview = s->show_preview && mx >= s->preview_x0;
+
+            /* Preview dock: any button starts a pan drag. */
+            if (in_preview) {
+                if (e->button.button == SDL_BUTTON_LEFT ||
+                    e->button.button == SDL_BUTTON_MIDDLE ||
+                    e->button.button == SDL_BUTTON_RIGHT) {
+                    s->preview_panning = true;
+                    s->preview_pan_anchor_mx = mx;
+                    s->preview_pan_anchor_my = my;
+                    s->preview_pan_anchor_px = s->preview_pan_x;
+                    s->preview_pan_anchor_py = s->preview_pan_y;
+                }
+                break;
+            }
+
+            /* Middle button → start panning (canvas only) */
+            if (e->button.button == SDL_BUTTON_MIDDLE && mx < s->canvas_w) {
+                s->panning = true;
+                s->pan_anchor_mx = mx; s->pan_anchor_my = my;
+                s->pan_anchor_px = s->pan_x; s->pan_anchor_py = s->pan_y;
+                break;
+            }
+
             if (e->button.button == SDL_BUTTON_LEFT) {
+                /* Space + LMB in canvas → pan instead of paint */
+                if (s->space_held && mx < s->canvas_w) {
+                    s->panning = true;
+                    s->pan_anchor_mx = mx; s->pan_anchor_my = my;
+                    s->pan_anchor_px = s->pan_x; s->pan_anchor_py = s->pan_y;
+                    break;
+                }
+                /* Scrollbar hit-test (LMB on visible scrollbar overlays) */
+                if (s->focus_zoom > 1 && mx < s->canvas_w && my < s->canvas_h) {
+                    int tx, tw, thx, thw;
+                    int ty, th, thy, thh;
+                    bool h = sb_h_geom(s, &tx, &tw, &thx, &thw);
+                    bool v = sb_v_geom(s, &ty, &th, &thy, &thh);
+                    /* H scrollbar occupies bottom strip */
+                    if (h && my >= s->canvas_h - SB_THICKNESS && mx < s->canvas_w - SB_THICKNESS) {
+                        if (mx >= thx && mx < thx + thw) {
+                            s->sb_drag = 1;
+                            s->sb_drag_anchor = mx;
+                            s->sb_drag_pan_start = s->pan_x;
+                        } else {
+                            /* Click outside thumb → jump */
+                            int max_pan_nes = s->chr_cols * TILE_W - s->canvas_w / fz_scale(s);
+                            if (tw > thw && max_pan_nes > 0)
+                                s->pan_x = (int)((long long)(mx - tx - thw/2) * max_pan_nes / (tw - thw));
+                            clamp_pan(s);
+                            s->sb_drag = 1;
+                            s->sb_drag_anchor = mx;
+                            s->sb_drag_pan_start = s->pan_x;
+                        }
+                        break;
+                    }
+                    if (v && mx >= s->canvas_w - SB_THICKNESS && my < s->canvas_h - SB_THICKNESS) {
+                        if (my >= thy && my < thy + thh) {
+                            s->sb_drag = 2;
+                            s->sb_drag_anchor = my;
+                            s->sb_drag_pan_start = s->pan_y;
+                        } else {
+                            int max_pan_nes = s->chr_rows * TILE_H - s->canvas_h / fz_scale(s);
+                            if (th > thh && max_pan_nes > 0)
+                                s->pan_y = (int)((long long)(my - ty - thh/2) * max_pan_nes / (th - thh));
+                            clamp_pan(s);
+                            s->sb_drag = 2;
+                            s->sb_drag_anchor = my;
+                            s->sb_drag_pan_start = s->pan_y;
+                        }
+                        break;
+                    }
+                }
+
                 s->mouse_down = true;
                 s->drag_in_edit_panel = (mx >= s->canvas_w && s->tile_edit);
                 /* Push undo before any canvas modification */
@@ -1142,18 +1516,18 @@ void input_handle(const SDL_Event *e, EditorState *s) {
                         s->anim_state == ANIM_PICKING_LAST) {
                         int ntiles = s->chr_cols * s->chr_rows;
                         int snapped;
+                        int nx = sx_to_nx(s, mx);
+                        int ny = sy_to_ny(s, my);
                         if (s->sprite_mode == SPRITE_16 && s->chr_cols >= 2) {
                             /* In sprite-16 mode tiles are column-major remapped;
                                use sprite-grid coords to get the correct base tile. */
-                            int nx = mx / s->zoom;
-                            int ny = my / s->zoom;
                             int sprite_cols = s->chr_cols / 2;
                             int sprite_x    = nx / (TILE_W * 2);
                             int sprite_y    = ny / (TILE_H * 2);
                             snapped = (sprite_y * sprite_cols + sprite_x) * 4;
                         } else {
-                            snapped = (my / (s->zoom * TILE_H)) * s->chr_cols
-                                    + (mx / (s->zoom * TILE_W));
+                            snapped = (ny / TILE_H) * s->chr_cols
+                                    + (nx / TILE_W);
                         }
                         if (snapped < 0) snapped = 0;
                         if (snapped >= ntiles) snapped = ntiles - 1;
@@ -1183,16 +1557,72 @@ void input_handle(const SDL_Event *e, EditorState *s) {
         }
 
         case SDL_MOUSEBUTTONUP:
+            if (e->button.button == SDL_BUTTON_MIDDLE) s->panning = false;
             if (e->button.button == SDL_BUTTON_LEFT) {
                 s->mouse_down = false;
                 s->drag_in_edit_panel = false;
+                s->panning = false;
+                s->sb_drag = 0;
             }
             if (e->button.button == SDL_BUTTON_RIGHT) s->right_mouse_down = false;
+            s->preview_panning = false;
             break;
 
         case SDL_MOUSEMOTION: {
             int mx = e->motion.x, my = e->motion.y;
             s->mouse_x = mx; s->mouse_y = my;
+
+            if (s->preview_panning) {
+                int z = s->preview_zoom;
+                s->preview_pan_x = s->preview_pan_anchor_px
+                                 - (mx - s->preview_pan_anchor_mx) / z;
+                s->preview_pan_y = s->preview_pan_anchor_py
+                                 - (my - s->preview_pan_anchor_my) / z;
+                int vw = s->preview_w / z; if (vw > 256) vw = 256;
+                int vh = s->preview_h / z; if (vh > 240) vh = 240;
+                int mpx = 256 - vw; if (mpx < 0) mpx = 0;
+                int mpy = 240 - vh; if (mpy < 0) mpy = 0;
+                if (s->preview_pan_x < 0)   s->preview_pan_x = 0;
+                if (s->preview_pan_y < 0)   s->preview_pan_y = 0;
+                if (s->preview_pan_x > mpx) s->preview_pan_x = mpx;
+                if (s->preview_pan_y > mpy) s->preview_pan_y = mpy;
+                break;
+            }
+
+            if (s->panning) {
+                int scale = fz_scale(s);
+                s->pan_x = s->pan_anchor_px - (mx - s->pan_anchor_mx) / scale;
+                s->pan_y = s->pan_anchor_py - (my - s->pan_anchor_my) / scale;
+                clamp_pan(s);
+                break;
+            }
+            if (s->sb_drag == 1) {
+                int tx, tw, thx, thw;
+                if (sb_h_geom(s, &tx, &tw, &thx, &thw)) {
+                    int max_pan_nes = s->chr_cols * TILE_W - s->canvas_w / fz_scale(s);
+                    if (tw > thw && max_pan_nes > 0) {
+                        int d = mx - s->sb_drag_anchor;
+                        s->pan_x = s->sb_drag_pan_start
+                            + (int)((long long)d * max_pan_nes / (tw - thw));
+                        clamp_pan(s);
+                    }
+                }
+                break;
+            }
+            if (s->sb_drag == 2) {
+                int ty, th, thy, thh;
+                if (sb_v_geom(s, &ty, &th, &thy, &thh)) {
+                    int max_pan_nes = s->chr_rows * TILE_H - s->canvas_h / fz_scale(s);
+                    if (th > thh && max_pan_nes > 0) {
+                        int d = my - s->sb_drag_anchor;
+                        s->pan_y = s->sb_drag_pan_start
+                            + (int)((long long)d * max_pan_nes / (th - thh));
+                        clamp_pan(s);
+                    }
+                }
+                break;
+            }
+
             if (s->mouse_down) {
                 if (s->drag_in_edit_panel) {
                     tile_edit_paint(s, mx - s->canvas_w, my);
@@ -1216,7 +1646,34 @@ void input_handle(const SDL_Event *e, EditorState *s) {
             if (s->show_help) {
                 s->help_scroll -= e->wheel.y * font_line_h() * 2;
                 if (s->help_scroll < 0) s->help_scroll = 0;
-            } else if (s->mouse_x >= s->canvas_w) {
+            } else if (s->show_preview && s->mouse_x >= s->preview_x0) {
+                /* Wheel over preview → zoom around cursor. */
+                int old_z = s->preview_zoom;
+                int new_z = old_z + e->wheel.y;
+                if (new_z < 1) new_z = 1;
+                if (new_z > 4) new_z = 4;
+                if (new_z != old_z) {
+                    int cx = s->mouse_x - s->preview_x0;
+                    int cy = s->mouse_y;
+                    int wx = s->preview_pan_x + cx / old_z;
+                    int wy = s->preview_pan_y + cy / old_z;
+                    s->preview_zoom  = new_z;
+                    s->preview_pan_x = wx - cx / new_z;
+                    s->preview_pan_y = wy - cy / new_z;
+                    int vw = s->preview_w / new_z; if (vw > 256) vw = 256;
+                    int vh = s->preview_h / new_z; if (vh > 240) vh = 240;
+                    int mpx = 256 - vw; if (mpx < 0) mpx = 0;
+                    int mpy = 240 - vh; if (mpy < 0) mpy = 0;
+                    if (s->preview_pan_x < 0)   s->preview_pan_x = 0;
+                    if (s->preview_pan_y < 0)   s->preview_pan_y = 0;
+                    if (s->preview_pan_x > mpx) s->preview_pan_x = mpx;
+                    if (s->preview_pan_y > mpy) s->preview_pan_y = mpy;
+                }
+            } else if (s->mouse_x < s->canvas_w) {
+                /* Wheel over canvas → focus zoom centred on cursor. */
+                focus_zoom_at(s, s->mouse_x, s->mouse_y,
+                              s->focus_zoom + e->wheel.y);
+            } else {
                 /* Scroll the palette list when wheeling over the panel. */
                 int py = s->mouse_y;
                 if (py >= PANEL_PAL_Y0 &&
